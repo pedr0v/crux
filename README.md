@@ -31,6 +31,12 @@ As an alternative, build crux from source:
 cargo install --git https://github.com/pedr0v/crux
 ```
 
+## Updates
+
+Run `crux self-update` to install the latest standalone version.
+Run `crux self-update --check` to check for an update without an installation.
+Halv updates its bundled crux through the app updater.
+
 ## Configuration for Claude Code
 
 1. Run this command:

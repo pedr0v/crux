@@ -1,3 +1,5 @@
+mod update;
+
 use anyhow::{anyhow, bail, Context, Result};
 use protobuf::Message;
 use scip::symbol::{is_local_symbol, parse_symbol};
@@ -1901,6 +1903,7 @@ fn run_indexer(
     let selection = select_language(project_root, override_language)?;
     fs::create_dir_all(project_root.join(".scip-nav"))
         .with_context(|| format!("create {}/.scip-nav", project_root.display()))?;
+    let pending_update = update::start_background_check(&project_root.join(".scip-nav"));
     let (program, args, needs_move) =
         indexer_command(selection.language, project_root, max_file_mb);
     let output = execute_indexer_command(&program, &args, project_root, selection.language)?;
@@ -1934,10 +1937,12 @@ fn run_indexer(
 
     cache.invalidate(project_root);
     let loaded = cache.load(project_root)?;
-    Ok(format_index_stats(
-        IndexStats::from_loaded(&loaded),
-        &selection,
-    ))
+    let mut stats = format_index_stats(IndexStats::from_loaded(&loaded), &selection);
+    if let Some(notice) = pending_update.and_then(|pending| pending.try_notice()) {
+        stats.push('\n');
+        stats.push_str(&notice);
+    }
+    Ok(stats)
 }
 
 #[derive(Deserialize)]
@@ -2452,13 +2457,19 @@ fn run() -> Result<()> {
             println!("crux {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
+        [command] if command == "self-update" => update::run_self_update(false),
+        [command, flag] if command == "self-update" && flag == "--check" => {
+            update::run_self_update(true)
+        }
         [command, project_root] if command == "check" => {
             let mut cache = IndexCache::default();
             let loaded = cache.load(Path::new(project_root))?;
             println!("{}", IndexStats::from_loaded(&loaded).compact());
             Ok(())
         }
-        _ => bail!("usage: crux [--version | check <absolute-project-root>]"),
+        _ => {
+            bail!("usage: crux [--version | self-update [--check] | check <absolute-project-root>]")
+        }
     }
 }
 
