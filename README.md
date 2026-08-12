@@ -42,8 +42,10 @@ Halv updates its bundled crux through the app updater.
 Run this command:
 
 ```sh
-claude mcp add crux -- /path/to/crux
+claude mcp add --scope user crux -- /path/to/crux
 ```
+
+Use `--scope user`. This scope makes crux available in every directory. Without the flag, Claude Code uses the `local` scope. The `local` scope binds the server to the current directory only. The server then does not appear in sessions that start in other directories.
 
 No other step is necessary. The agent creates the index automatically on first use. The first query in a large project takes longer because it builds the index.
 
@@ -55,6 +57,8 @@ Add these lines to `~/.codex/config.toml`:
 [mcp_servers.crux]
 command = "/path/to/crux"
 ```
+
+This file is global. Codex reads it in every directory, so no scope flag is necessary.
 
 No other step is necessary. The agent creates the index automatically on first use.
 
