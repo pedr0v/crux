@@ -39,24 +39,24 @@ Halv updates its bundled crux through the app updater.
 
 ## Configuration for Claude Code
 
-1. Run this command:
+Run this command:
 
 ```sh
 claude mcp add crux -- /path/to/crux
 ```
 
-2. Tell Claude to run `scip_index` one time in each project.
+No other step is necessary. The agent creates the index automatically on first use. The first query in a large project takes longer because it builds the index.
 
 ## Configuration for Codex CLI
 
-1. Add these lines to `~/.codex/config.toml`:
+Add these lines to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.crux]
 command = "/path/to/crux"
 ```
 
-2. Tell Codex to run `scip_index` one time in each project.
+No other step is necessary. The agent creates the index automatically on first use.
 
 ## How agents discover crux
 
