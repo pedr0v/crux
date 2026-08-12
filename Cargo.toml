@@ -1,6 +1,6 @@
 [package]
 name = "crux"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Token-efficient code navigation for AI coding agents — SCIP-backed MCP server"
 license = "MIT"

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+const SERVER_INSTRUCTIONS: &str = "crux serves a code index for this machine's projects. For code navigation (find a definition, list references, map callers, audit dead exports), call scip_map first — one call returns definitions, signatures, and reference sites with source lines for up to 8 symbols. Use scip_callers for call graphs and scip_outline for file structure. If a tool reports a missing index, call scip_index once with the project root. Prefer these tools over file reads and text search when the question is about symbols; fall back to reading files when you need full context or the index lacks a symbol (for example, closure-local functions).";
 const DEFAULT_SEARCH_LIMIT: usize = 20;
 const DEFAULT_REFS_LIMIT: usize = 50;
 const DEFAULT_MAP_REFS_LIMIT: usize = 40;
@@ -2190,6 +2191,7 @@ impl Server {
                     json!({
                         "protocolVersion": protocol_version,
                         "capabilities": {"tools": {}},
+                        "instructions": SERVER_INSTRUCTIONS,
                         "serverInfo": {
                             "name": "crux",
                             "version": env!("CARGO_PKG_VERSION")
@@ -3617,6 +3619,29 @@ mod tests {
             responses[2].pointer("/result/content/0/text"),
             Some(&json!("10 function formatDateLong\n42 function formatDate"))
         );
+    }
+
+    #[test]
+    fn initialize_response_includes_non_empty_instructions() {
+        let mut server = Server::default();
+        let response = server
+            .dispatch_line(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {}
+                })
+                .to_string(),
+            )
+            .expect("initialize response");
+        let response: Value = serde_json::from_str(&response).expect("valid response json");
+        let instructions = response
+            .pointer("/result/instructions")
+            .and_then(Value::as_str)
+            .expect("instructions string");
+
+        assert!(!instructions.is_empty());
     }
 
     #[test]

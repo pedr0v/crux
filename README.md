@@ -52,6 +52,10 @@ command = "/path/to/crux"
 
 2. Tell Codex to run `scip_index` one time in each project.
 
+## How agents discover crux
+
+The server sends tool descriptions and instructions through the MCP protocol. Agents such as Claude Code and Codex read this information automatically. The user does not write a prompt.
+
 ## Tools
 
 | Tool | Function |
