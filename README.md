@@ -11,7 +11,7 @@ crux is an MCP server for AI coding agents. It reads a [SCIP](https://github.com
 
 The agent does not read full files to find these answers. Thus the agent uses fewer tokens.
 
-We measured the results on large codebases (600+ files). Navigation tasks used 33% fewer tokens. Caller-graph queries used 64% fewer tokens. On small repositories (fewer than approximately 200 files), grep is sufficient. crux is made for the codebases where grep output is too large.
+We measured the results on large codebases (600+ files). Navigation tasks used 33% fewer tokens. Caller-graph queries used 64% fewer tokens. On small repositories (fewer than approximately 200 files), grep is sufficient. crux is made for the codebases where grep output is too large. The section [Measured results](#measured-results) shows the full data.
 
 ## Installation
 
@@ -77,6 +77,25 @@ command = "/path/to/crux"
 | C / C++ | `scip-clang` | Supply a `compile_commands.json` compilation database. |
 
 crux writes the index to `<project>/.scip-nav/index.scip`. Add `.scip-nav/` to your global gitignore file.
+
+## Measured results
+
+We ran eight controlled A/B experiments. Each experiment used two agents with the same task on the same codebase. One agent used crux. One agent used grep and file reads. We measured the total agent tokens. Lower is better.
+
+| Task | Codebase | Tokens with crux | Tokens with grep | Difference |
+| --- | --- | --- | --- | --- |
+| Fix two planted bugs | 136 files, 112k LOC | 43,613 | 46,503 | −6% |
+| Reference map | 251 files, 65k LOC | 25,967 | 29,824 | −13% |
+| Reference map | 77 files, 193k LOC | 33,551 | 39,872 | −16% |
+| Reference map | 601 files, 1.5M LOC | 25,975 | 38,886 | **−33%** |
+| Caller graph, depth 2 | 251 files | 29,522 | 82,089 | **−64%** |
+| Dead-export audit | 230 exports | 42,179 | 53,388 | −21% |
+
+Notes on the data:
+
+- The large codebase is the TypeScript compiler. The 136-file codebase is a production React app.
+- Each cell is one run. Treat differences below 10% as noise.
+- Answer quality was equal in all runs. Independent graders verified each answer against precomputed ground truth.
 
 ## crux and Halv
 
