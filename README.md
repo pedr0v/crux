@@ -186,7 +186,7 @@ Each question used paired, token-metered Codex CLI runs.
 
 On definition lookups, the agent skips the index (0 calls, cost parity); the gains come from callers and reference questions.
 
-Read the [accessible post](https://halv.app/blog/crux-benchmark) and the [methodology deep-dive](https://halv.app/blog/crux-benchmark-deep-dive).
+Read the [accessible post](https://halv.ai/blog/crux-benchmark) and the [methodology deep-dive](https://halv.ai/blog/crux-benchmark-deep-dive).
 
 ## crux and Halv
 
