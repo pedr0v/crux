@@ -680,8 +680,30 @@ pub(crate) fn map_symbols(
     }
 
     let mut sources = SourceCache::new(project_root);
+    let mut resolutions = Vec::new();
     let mut lines = Vec::new();
     for name in names {
+        let exact_qualified = index
+            .index()
+            .documents
+            .iter()
+            .flat_map(|document| document.symbols.iter())
+            .chain(index.index().external_symbols.iter())
+            .any(|information| qualified_name(information) == *name || information.symbol == *name);
+        let exact_bare = index
+            .index()
+            .documents
+            .iter()
+            .flat_map(|document| document.symbols.iter())
+            .chain(index.index().external_symbols.iter())
+            .any(|information| display_name(information) == *name);
+        if !exact_qualified && !exact_bare {
+            lines.push(format!(
+                "no symbol named {name}; try scip_find with a fragment"
+            ));
+            continue;
+        }
+
         let symbols = matching_symbol_ids(index, name);
         let mut matches = symbols
             .principals
@@ -697,7 +719,9 @@ pub(crate) fn map_symbols(
         });
 
         if matches.is_empty() {
-            lines.push(format!("## no matches: {name}"));
+            lines.push(format!(
+                "no symbol named {name}; try scip_find with a fragment"
+            ));
             continue;
         }
         if matches.len() > 1 {
@@ -711,6 +735,9 @@ pub(crate) fn map_symbols(
         }
 
         let (file, line, symbol, information) = matches.remove(0);
+        if !exact_qualified {
+            resolutions.push(format!("resolved {name} → {}", qualified_name(information)));
+        }
         lines.push(format!("## {}", qualified_name(information)));
         lines.push(format!(
             "definition: {} {file}:{}",
@@ -752,7 +779,8 @@ pub(crate) fn map_symbols(
         let callers = index.direct_caller_lines(project_root, &reference_symbols);
         append_limited_section(&mut lines, "callers", callers, ref_limit);
     }
-    Ok(lines.join("\n"))
+    resolutions.extend(lines);
+    Ok(resolutions.join("\n"))
 }
 
 pub(crate) fn references(index: &SemanticIndex, name: &str, limit: usize) -> Result<String> {

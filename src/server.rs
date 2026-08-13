@@ -3,6 +3,7 @@ use crate::queries::{
     callers, dead_exports, definitions, find, map_symbols, outline, references, search,
     MAX_MAP_NAMES,
 };
+use crate::setup;
 use crate::update;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -13,8 +14,8 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
-const FULL_INSTRUCTIONS: &str = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely. Use scip_find to locate or disambiguate. Use ONE scip_map call for depth. Plain text search is cheaper for a simple 'where is X defined' question. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
-const SLIM_INSTRUCTIONS: &str = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely. Use scip_find to locate or disambiguate. Use ONE scip_map call for depth. Plain text search is cheaper for a simple 'where is X defined' question. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
+const FULL_INSTRUCTIONS: &str = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely. Use scip_map directly with the symbol name; it resolves or lists candidates. Use scip_find for fragments, browsing, and unreferenced audits. Plain text search is cheaper for a simple 'where is X defined' question. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
+const SLIM_INSTRUCTIONS: &str = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely. Use scip_map directly with the symbol name; it resolves or lists candidates. Use scip_find for fragments, browsing, and unreferenced audits. Plain text search is cheaper for a simple 'where is X defined' question. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
 const EXPANDED_TOOLS: &str = "expanded: scip_search, scip_def, scip_refs, scip_callers, scip_dead";
 const DEFAULT_FIND_LIMIT: usize = 20;
 const DEFAULT_MAP_REF_LIMIT: usize = 20;
@@ -28,6 +29,7 @@ pub(crate) const DEFAULT_CALLERS_LIMIT: usize = 40;
 pub(crate) const DEFAULT_DEAD_LIMIT: usize = 100;
 pub(crate) const MAX_LIMIT: usize = 200;
 const MAX_CALLER_DEPTH: usize = 3;
+const HELP_TEXT: &str = "Usage:\n  crux [--profile slim|full]\n  crux [--profile slim|full] --version\n  crux self-update [--check]\n  crux check <absolute-project-root>\n  crux setup <codex|claude> [--project <dir>]\n  crux unsetup <codex|claude> [--project <dir>]";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Profile {
@@ -421,7 +423,7 @@ fn slim_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "scip_index",
-            "description": "Build or refresh an index.",
+            "description": "Builds or refreshes the code index for a project root — call once if another tool reports a missing index.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -442,7 +444,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_find",
-            "description": "Find symbols or unreferenced symbols.",
+            "description": "Answers 'which symbol matches this name or fragment?' — use to find or disambiguate symbols; set unreferenced=true to list dead symbols.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -467,7 +469,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_map",
-            "description": "Show definitions, references, and callers.",
+            "description": "Answers 'who calls X?', 'what references X?', and 'where is X defined?' completely in ONE call — use before any text search for symbol questions.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -479,7 +481,7 @@ fn slim_tool_definitions() -> Vec<Value> {
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": MAX_MAP_NAMES,
-                        "description": "Qualified names, up to eight."
+                        "description": "Symbol names, bare or qualified, up to eight."
                     },
                     "ref_limit": {
                         "type": "integer",
@@ -492,7 +494,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_outline",
-            "description": "Outline one file.",
+            "description": "Answers 'what symbols are defined in this file?' — use for file structure at a glance.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -509,7 +511,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_expand",
-            "description": "Reveal finer-grained tools.",
+            "description": "Need finer-grained search, definition, references, callers, or dead-code tools? Call this to reveal them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -705,6 +707,10 @@ pub fn run() -> Result<()> {
     let (profile, arguments) = resolve_profile(arguments, environment_profile.as_deref())?;
     match arguments.as_slice() {
         [] => run_stdio(profile),
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!("{HELP_TEXT}");
+            Ok(())
+        }
         [flag] if flag == "--version" || flag == "-V" => {
             println!("crux {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -719,8 +725,16 @@ pub fn run() -> Result<()> {
             println!("{}", IndexStats::from_loaded(&loaded).compact());
             Ok(())
         }
+        [command, arguments @ ..] if command == "setup" || command == "unsetup" => {
+            let (client, project) = setup::parse_client_arguments(arguments)?;
+            if command == "setup" {
+                setup::run_setup(client, project.as_deref())
+            } else {
+                setup::run_unsetup(client, project.as_deref())
+            }
+        }
         _ => {
-            bail!("usage: crux [--profile slim|full] [--version | self-update [--check] | check <absolute-project-root>]")
+            bail!("{HELP_TEXT}")
         }
     }
 }
@@ -749,7 +763,7 @@ mod tests {
     }
 
     #[test]
-    fn scip_map_returns_a_complete_basic_bundle_with_defaults() {
+    fn scip_map_resolves_a_unique_bare_name_with_a_note() {
         let project = TestProject::new();
         write_fixture(&project, false);
         let mut server = Server::default();
@@ -764,8 +778,70 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(
             result.text,
-            "## date.ts/formatDate().\ndefinition: function src/lib/date.ts:42\nsignature: function formatDate(input: Date): string\nreferences:\nsrc/app.ts:40: const label = formatDate(today);\nsrc/lib/date.ts:15: return formatDate(input);\ncallers:\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)"
+            "resolved formatDate → date.ts/formatDate().\n## date.ts/formatDate().\ndefinition: function src/lib/date.ts:42\nsignature: function formatDate(input: Date): string\nreferences:\nsrc/app.ts:40: const label = formatDate(today);\nsrc/lib/date.ts:15: return formatDate(input);\ncallers:\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)"
         );
+    }
+
+    #[test]
+    fn scip_map_lists_candidates_for_a_bare_name_with_multiple_matches() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let mut server = Server::default();
+        let result = server.call_tool(
+            "scip_map",
+            &json!({
+                "project_root": project.root,
+                "names": ["rngState"]
+            }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(
+            result.text,
+            "## ambiguous: rngState\npersistence.ts/SaveData#rngState. | property | src/persistence.ts:34 | rngState: number\nrng.ts/rngState(). | function | src/lib/rng.ts:3 | function rngState(): number"
+        );
+    }
+
+    #[test]
+    fn scip_map_returns_a_find_hint_when_no_bare_name_matches() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let mut server = Server::default();
+        let result = server.call_tool(
+            "scip_map",
+            &json!({
+                "project_root": project.root,
+                "names": ["formatDateLo"]
+            }),
+        );
+
+        assert!(!result.is_error);
+        assert_eq!(
+            result.text,
+            "no symbol named formatDateLo; try scip_find with a fragment"
+        );
+    }
+
+    #[test]
+    fn scip_map_answers_mixed_bare_and_qualified_names() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let mut server = Server::default();
+        let result = server.call_tool(
+            "scip_map",
+            &json!({
+                "project_root": project.root,
+                "names": ["formatDate", "rng.ts/rngState()."]
+            }),
+        );
+
+        assert!(!result.is_error);
+        assert!(result
+            .text
+            .starts_with("resolved formatDate → date.ts/formatDate().\n"));
+        assert_eq!(result.text.matches("resolved ").count(), 1);
+        assert!(result.text.contains("## date.ts/formatDate()."));
+        assert!(result.text.contains("## rng.ts/rngState()."));
     }
 
     #[test]
@@ -935,8 +1011,9 @@ mod tests {
 
             assert!(instructions.starts_with(required_lead));
             assert!(instructions.split_whitespace().count() < 120);
-            assert!(instructions.contains("Use scip_find to locate or disambiguate"));
-            assert!(instructions.contains("Use ONE scip_map call for depth"));
+            assert!(instructions.contains("Use scip_map directly with the symbol name"));
+            assert!(instructions
+                .contains("Use scip_find for fragments, browsing, and unreferenced audits"));
             assert!(instructions.contains("Plain text search is cheaper"));
             assert!(instructions.contains("at most two index calls before answering"));
             assert_eq!(instructions.contains("Call scip_expand"), expansion_hint);
@@ -952,13 +1029,14 @@ mod tests {
         let slim = rpc_success(json!(1), json!({"tools": tool_definitions(false)}));
         let full = rpc_success(json!(1), json!({"tools": tool_definitions(true)}));
 
+        // Trigger-worded SLIM descriptions spend more of both budgets to improve organic adoption.
         assert!(
-            slim.len() < 2_000,
+            slim.len() <= 2_600,
             "slim tools/list JSON is {} characters",
             slim.len()
         );
         assert!(
-            full.len() < 4_000,
+            full.len() <= 4_600,
             "full tools/list JSON is {} characters",
             full.len()
         );
