@@ -1,5 +1,5 @@
 use crate::semantic::symbol_container;
-use scip::symbol::parse_symbol;
+use scip::symbol::{format_symbol_with, parse_symbol, SymbolFormatOptions};
 use scip::types::{descriptor, symbol_information, SymbolInformation};
 use std::collections::HashMap;
 use std::fs;
@@ -28,6 +28,25 @@ pub(crate) fn display_name(information: &SymbolInformation) -> String {
             !character.is_alphanumeric() && character != '_' && character != '$'
         })
         .to_string()
+}
+
+pub(crate) fn qualified_name(information: &SymbolInformation) -> String {
+    parse_symbol(&information.symbol)
+        .ok()
+        .map(|symbol| {
+            format_symbol_with(
+                symbol,
+                SymbolFormatOptions {
+                    include_scheme: false,
+                    include_package_manager: false,
+                    include_package_name: false,
+                    include_package_version: false,
+                    include_descriptor: true,
+                },
+            )
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| display_name(information))
 }
 
 pub(crate) fn inferred_kind(information: &SymbolInformation) -> String {
@@ -197,11 +216,8 @@ fn is_import_or_export_line(source: &str) -> bool {
 }
 
 pub(crate) fn symbol_details(information: &SymbolInformation) -> String {
-    let signature = information
-        .signature_documentation
-        .as_ref()
-        .map(|signature| compact_whitespace(&signature.text))
-        .filter(|signature| !signature.is_empty());
+    let signature = symbol_signature(information);
+    let signature = (!signature.is_empty()).then_some(signature);
     let documentation = information
         .documentation
         .first()
@@ -215,6 +231,16 @@ pub(crate) fn symbol_details(information: &SymbolInformation) -> String {
         (None, None) => String::new(),
     };
     truncate_chars(&details, DOC_CHAR_LIMIT)
+}
+
+pub(crate) fn symbol_signature(information: &SymbolInformation) -> String {
+    information
+        .signature_documentation
+        .as_ref()
+        .map(|signature| compact_whitespace(&signature.text))
+        .filter(|signature| !signature.is_empty())
+        .map(|signature| truncate_chars(&signature, DOC_CHAR_LIMIT))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

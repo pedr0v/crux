@@ -1,6 +1,7 @@
 use crate::index::{run_indexer, IndexCache, IndexStats};
 use crate::queries::{
-    callers, dead_exports, definitions, map_bundle, outline, references, search, MAX_MAP_NAMES,
+    callers, dead_exports, definitions, find, map_symbols, outline, references, search,
+    MAX_MAP_NAMES,
 };
 use crate::update;
 use anyhow::{anyhow, bail, Context, Result};
@@ -12,14 +13,46 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
-const SERVER_INSTRUCTIONS: &str = "crux serves a code index for this machine's projects. For code navigation (find a definition, list references, map callers, audit dead exports), call scip_map first — one call returns definitions, signatures, and reference sites with source lines for up to 8 symbols. Use scip_callers for call graphs and scip_outline for file structure. If a tool reports a missing index, call scip_index once with the project root. Prefer these tools over file reads and text search when the question is about symbols; fall back to reading files when you need full context or the index lacks a symbol (for example, closure-local functions).";
+const FULL_INSTRUCTIONS: &str = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely. Use scip_find to locate or disambiguate. Use ONE scip_map call for depth. Plain text search is cheaper for a simple 'where is X defined' question. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
+const SLIM_INSTRUCTIONS: &str = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely. Use scip_find to locate or disambiguate. Use ONE scip_map call for depth. Plain text search is cheaper for a simple 'where is X defined' question. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
+const EXPANDED_TOOLS: &str = "expanded: scip_search, scip_def, scip_refs, scip_callers, scip_dead";
+const DEFAULT_FIND_LIMIT: usize = 20;
+const DEFAULT_MAP_REF_LIMIT: usize = 20;
+const DEFAULT_NARROW_REFS_LIMIT: usize = 50;
 const DEFAULT_SEARCH_LIMIT: usize = 20;
-pub(crate) const DEFAULT_REFS_LIMIT: usize = 50;
-pub(crate) const DEFAULT_MAP_REFS_LIMIT: usize = 40;
+#[cfg(test)]
+pub(crate) const DEFAULT_REFS_LIMIT: usize = 20;
+#[cfg(test)]
+pub(crate) const DEFAULT_MAP_REFS_LIMIT: usize = 20;
 pub(crate) const DEFAULT_CALLERS_LIMIT: usize = 40;
 pub(crate) const DEFAULT_DEAD_LIMIT: usize = 100;
 pub(crate) const MAX_LIMIT: usize = 200;
 const MAX_CALLER_DEPTH: usize = 3;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum Profile {
+    #[default]
+    Slim,
+    Full,
+}
+
+impl Profile {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "slim" => Ok(Self::Slim),
+            "full" => Ok(Self::Full),
+            _ => bail!("invalid profile '{value}'; expected slim or full"),
+        }
+    }
+
+    fn instructions(self) -> &'static str {
+        match self {
+            Self::Slim => SLIM_INSTRUCTIONS,
+            Self::Full => FULL_INSTRUCTIONS,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct IndexArgs {
     project_root: String,
@@ -27,6 +60,16 @@ struct IndexArgs {
     language: Option<String>,
     #[serde(default)]
     max_file_mb: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct FindArgs {
+    project_root: String,
+    name: String,
+    #[serde(default = "default_find_limit")]
+    limit: usize,
+    #[serde(default)]
+    unreferenced: bool,
 }
 
 #[derive(Deserialize)]
@@ -47,12 +90,8 @@ struct NameArgs {
 struct MapArgs {
     project_root: String,
     names: Vec<String>,
-    #[serde(default = "default_true")]
-    context: bool,
-    #[serde(default = "default_map_refs_limit")]
-    refs_limit: usize,
-    #[serde(default)]
-    include_imports: bool,
+    #[serde(default = "default_map_ref_limit")]
+    ref_limit: usize,
 }
 
 #[derive(Deserialize)]
@@ -90,16 +129,24 @@ struct OutlineArgs {
     file: String,
 }
 
+fn default_find_limit() -> usize {
+    DEFAULT_FIND_LIMIT
+}
+
 fn default_search_limit() -> usize {
     DEFAULT_SEARCH_LIMIT
 }
 
-fn default_refs_limit() -> usize {
-    DEFAULT_REFS_LIMIT
+fn default_map_ref_limit() -> usize {
+    DEFAULT_MAP_REF_LIMIT
 }
 
-fn default_map_refs_limit() -> usize {
-    DEFAULT_MAP_REFS_LIMIT
+fn default_refs_limit() -> usize {
+    DEFAULT_NARROW_REFS_LIMIT
+}
+
+fn default_caller_depth() -> usize {
+    1
 }
 
 fn default_callers_limit() -> usize {
@@ -108,10 +155,6 @@ fn default_callers_limit() -> usize {
 
 fn default_dead_limit() -> usize {
     DEFAULT_DEAD_LIMIT
-}
-
-fn default_caller_depth() -> usize {
-    1
 }
 
 fn default_true() -> bool {
@@ -155,83 +198,126 @@ impl ToolResult {
     }
 }
 
-#[derive(Default)]
 struct Server {
     cache: IndexCache,
+    profile: Profile,
+    expanded: bool,
+    list_changed_pending: bool,
+}
+
+impl Default for Server {
+    fn default() -> Self {
+        Self::new(Profile::Slim)
+    }
 }
 
 impl Server {
+    fn new(profile: Profile) -> Self {
+        Self {
+            cache: IndexCache::default(),
+            profile,
+            expanded: profile == Profile::Full,
+            list_changed_pending: false,
+        }
+    }
+
+    fn expand(&mut self) -> String {
+        if self.expanded {
+            return "already expanded".to_string();
+        }
+        self.expanded = true;
+        self.list_changed_pending = true;
+        EXPANDED_TOOLS.to_string()
+    }
+
     fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolResult {
-        let result = match name {
-            "scip_index" => parse_arguments::<IndexArgs>(arguments).and_then(|arguments| {
-                run_indexer(
-                    Path::new(&arguments.project_root),
-                    arguments.language.as_deref(),
-                    arguments.max_file_mb,
-                    &mut self.cache,
-                )
-            }),
-            "scip_search" => parse_arguments::<SearchArgs>(arguments).and_then(|arguments| {
-                let loaded = self.cache.load(Path::new(&arguments.project_root))?;
-                search(
-                    &loaded.index,
-                    &arguments.query,
-                    bounded_limit(arguments.limit),
-                )
-            }),
-            "scip_def" => parse_arguments::<NameArgs>(arguments).and_then(|arguments| {
-                let project_root = Path::new(&arguments.project_root);
-                let loaded = self.cache.load(project_root)?;
-                definitions(project_root, &loaded.index, &arguments.name)
-            }),
-            "scip_map" => parse_arguments::<MapArgs>(arguments).and_then(|arguments| {
-                let project_root = Path::new(&arguments.project_root);
-                let loaded = self.cache.load(project_root)?;
-                map_bundle(
-                    project_root,
-                    &loaded.index,
-                    &arguments.names,
-                    arguments.context,
-                    bounded_limit(arguments.refs_limit),
-                    arguments.include_imports,
-                )
-            }),
-            "scip_refs" => parse_arguments::<RefsArgs>(arguments).and_then(|arguments| {
-                let loaded = self.cache.load(Path::new(&arguments.project_root))?;
-                references(
-                    &loaded.index,
-                    &arguments.name,
-                    bounded_limit(arguments.limit),
-                )
-            }),
-            "scip_callers" => parse_arguments::<CallersArgs>(arguments).and_then(|arguments| {
-                let project_root = Path::new(&arguments.project_root);
-                let loaded = self.cache.load(project_root)?;
-                callers(
-                    project_root,
-                    &loaded.index,
-                    &arguments.name,
-                    arguments.depth.clamp(1, MAX_CALLER_DEPTH),
-                    bounded_limit(arguments.limit),
-                )
-            }),
-            "scip_dead" => parse_arguments::<DeadArgs>(arguments).and_then(|arguments| {
-                let project_root = Path::new(&arguments.project_root);
-                let loaded = self.cache.load(project_root)?;
-                dead_exports(
-                    project_root,
-                    &loaded.index,
-                    arguments.path_prefix.as_deref(),
-                    bounded_limit(arguments.limit),
-                    arguments.exports_only,
-                )
-            }),
-            "scip_outline" => parse_arguments::<OutlineArgs>(arguments).and_then(|arguments| {
-                let loaded = self.cache.load(Path::new(&arguments.project_root))?;
-                outline(&loaded.index, &arguments.file)
-            }),
-            _ => Err(anyhow!("unknown tool: {name}")),
-        };
+        let result =
+            match name {
+                "scip_index" => parse_arguments::<IndexArgs>(arguments).and_then(|arguments| {
+                    run_indexer(
+                        Path::new(&arguments.project_root),
+                        arguments.language.as_deref(),
+                        arguments.max_file_mb,
+                        &mut self.cache,
+                    )
+                }),
+                "scip_find" => parse_arguments::<FindArgs>(arguments).and_then(|arguments| {
+                    let loaded = self.cache.load(Path::new(&arguments.project_root))?;
+                    find(
+                        &loaded.index,
+                        &arguments.name,
+                        bounded_limit(arguments.limit),
+                        arguments.unreferenced,
+                    )
+                }),
+                "scip_search" if self.expanded => parse_arguments::<SearchArgs>(arguments)
+                    .and_then(|arguments| {
+                        let loaded = self.cache.load(Path::new(&arguments.project_root))?;
+                        search(
+                            &loaded.index,
+                            &arguments.query,
+                            bounded_limit(arguments.limit),
+                        )
+                    }),
+                "scip_def" if self.expanded => {
+                    parse_arguments::<NameArgs>(arguments).and_then(|arguments| {
+                        let project_root = Path::new(&arguments.project_root);
+                        let loaded = self.cache.load(project_root)?;
+                        definitions(project_root, &loaded.index, &arguments.name)
+                    })
+                }
+                "scip_map" => parse_arguments::<MapArgs>(arguments).and_then(|arguments| {
+                    let project_root = Path::new(&arguments.project_root);
+                    let loaded = self.cache.load(project_root)?;
+                    map_symbols(
+                        project_root,
+                        &loaded.index,
+                        &arguments.names,
+                        bounded_limit(arguments.ref_limit),
+                    )
+                }),
+                "scip_refs" if self.expanded => {
+                    parse_arguments::<RefsArgs>(arguments).and_then(|arguments| {
+                        let loaded = self.cache.load(Path::new(&arguments.project_root))?;
+                        references(
+                            &loaded.index,
+                            &arguments.name,
+                            bounded_limit(arguments.limit),
+                        )
+                    })
+                }
+                "scip_callers" if self.expanded => parse_arguments::<CallersArgs>(arguments)
+                    .and_then(|arguments| {
+                        let project_root = Path::new(&arguments.project_root);
+                        let loaded = self.cache.load(project_root)?;
+                        callers(
+                            project_root,
+                            &loaded.index,
+                            &arguments.name,
+                            arguments.depth.clamp(1, MAX_CALLER_DEPTH),
+                            bounded_limit(arguments.limit),
+                        )
+                    }),
+                "scip_dead" if self.expanded => {
+                    parse_arguments::<DeadArgs>(arguments).and_then(|arguments| {
+                        let project_root = Path::new(&arguments.project_root);
+                        let loaded = self.cache.load(project_root)?;
+                        dead_exports(
+                            project_root,
+                            &loaded.index,
+                            arguments.path_prefix.as_deref(),
+                            bounded_limit(arguments.limit),
+                            arguments.exports_only,
+                        )
+                    })
+                }
+                "scip_outline" => parse_arguments::<OutlineArgs>(arguments).and_then(|arguments| {
+                    let loaded = self.cache.load(Path::new(&arguments.project_root))?;
+                    outline(&loaded.index, &arguments.file)
+                }),
+                "scip_expand" => Ok(self.expand()),
+                _ => Err(anyhow!("unknown tool: {name}")),
+            };
 
         match result {
             Ok(text) => ToolResult::success(text),
@@ -270,8 +356,8 @@ impl Server {
                     id,
                     json!({
                         "protocolVersion": protocol_version,
-                        "capabilities": {"tools": {}},
-                        "instructions": SERVER_INSTRUCTIONS,
+                        "capabilities": {"tools": {"listChanged": true}},
+                        "instructions": self.profile.instructions(),
                         "serverInfo": {
                             "name": "crux",
                             "version": env!("CARGO_PKG_VERSION")
@@ -279,7 +365,7 @@ impl Server {
                     }),
                 )
             }
-            "tools/list" => rpc_success(id, json!({"tools": tool_definitions()})),
+            "tools/list" => rpc_success(id, json!({"tools": tool_definitions(self.expanded)})),
             "tools/call" => {
                 let Some(name) = request.pointer("/params/name").and_then(Value::as_str) else {
                     return has_id.then(|| rpc_error(id, -32602, "missing tool name"));
@@ -296,6 +382,14 @@ impl Server {
 
         has_id.then_some(response)
     }
+
+    fn dispatch_messages(&mut self, line: &str) -> Vec<String> {
+        let mut messages = self.dispatch_line(line).into_iter().collect::<Vec<_>>();
+        if std::mem::take(&mut self.list_changed_pending) {
+            messages.push(rpc_notification("notifications/tools/list_changed"));
+        }
+        messages
+    }
 }
 
 fn rpc_success(id: Value, result: Value) -> String {
@@ -311,68 +405,125 @@ fn rpc_error(id: Value, code: i64, message: &str) -> String {
     .to_string()
 }
 
-fn tool_definitions() -> Vec<Value> {
+fn rpc_notification(method: &str) -> String {
+    json!({"jsonrpc": "2.0", "method": method}).to_string()
+}
+
+fn tool_definitions(expanded: bool) -> Vec<Value> {
+    let mut tools = slim_tool_definitions();
+    if expanded {
+        tools.extend(narrow_tool_definitions());
+    }
+    tools
+}
+
+fn slim_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "scip_index",
-            "description": "Create or refresh the project's SCIP index.",
+            "description": "Build or refresh an index.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
-                        "description": "Absolute project path"
+                        "description": "Absolute root."
                     },
                     "language": {
                         "type": "string",
-                        "enum": ["typescript", "python", "rust", "dart", "java", "cpp"],
-                        "description": "Optional language override; otherwise detected from project markers"
+                        "description": "Optional language override."
                     },
                     "max_file_mb": {
                         "type": "integer",
-                        "minimum": 1,
-                        "description": "Optional scip-typescript maximum file size in MB"
+                        "description": "TypeScript file limit in MB."
                     }
                 }),
                 &["project_root"]
             )
         }),
         json!({
-            "name": "scip_map",
-            "description": "one call answers: definitions, signatures, and all reference sites with source context for up to 8 symbols — prefer this over repeated scip_def/scip_refs",
+            "name": "scip_find",
+            "description": "Find symbols or unreferenced symbols.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
-                        "description": "Absolute project path"
+                        "description": "Absolute root."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name fragment, or * for unreferenced symbols."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Candidate limit."
+                    },
+                    "unreferenced": {
+                        "type": "boolean",
+                        "description": "Require no inbound references."
+                    }
+                }),
+                &["project_root", "name"]
+            )
+        }),
+        json!({
+            "name": "scip_map",
+            "description": "Show definitions, references, and callers.",
+            "inputSchema": object_schema(
+                json!({
+                    "project_root": {
+                        "type": "string",
+                        "description": "Absolute root."
                     },
                     "names": {
                         "type": "array",
                         "items": {"type": "string"},
                         "minItems": 1,
-                        "maxItems": MAX_MAP_NAMES
+                        "maxItems": MAX_MAP_NAMES,
+                        "description": "Qualified names, up to eight."
                     },
-                    "context": {
-                        "type": "boolean",
-                        "default": true
-                    },
-                    "refs_limit": {
+                    "ref_limit": {
                         "type": "integer",
-                        "default": DEFAULT_MAP_REFS_LIMIT,
-                        "minimum": 1,
-                        "maximum": MAX_LIMIT
-                    },
-                    "include_imports": {
-                        "type": "boolean",
-                        "default": false
+                        "default": DEFAULT_MAP_REF_LIMIT,
+                        "description": "Per-symbol reference and caller limit."
                     }
                 }),
                 &["project_root", "names"]
             )
         }),
         json!({
+            "name": "scip_outline",
+            "description": "Outline one file.",
+            "inputSchema": object_schema(
+                json!({
+                    "project_root": {
+                        "type": "string",
+                        "description": "Absolute root."
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "Project-relative file."
+                    }
+                }),
+                &["project_root", "file"]
+            )
+        }),
+        json!({
+            "name": "scip_expand",
+            "description": "Reveal finer-grained tools.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+    ]
+}
+
+fn narrow_tool_definitions() -> Vec<Value> {
+    vec![
+        json!({
             "name": "scip_search",
             "description": "Search symbol display names and return disambiguated definition locations.",
-            "inputSchema": object_schema(
+            "inputSchema": narrow_object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
@@ -392,7 +543,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "scip_def",
             "description": "Find definition sites with signatures and source lines for one name; prefer scip_map for multi-symbol navigation.",
-            "inputSchema": object_schema(
+            "inputSchema": narrow_object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
@@ -406,7 +557,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "scip_refs",
             "description": "Find reference lines grouped by file for one name; prefer scip_map for source context.",
-            "inputSchema": object_schema(
+            "inputSchema": narrow_object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
@@ -415,7 +566,7 @@ fn tool_definitions() -> Vec<Value> {
                     "name": {"type": "string"},
                     "limit": {
                         "type": "integer",
-                        "default": DEFAULT_REFS_LIMIT,
+                        "default": DEFAULT_NARROW_REFS_LIMIT,
                         "minimum": 1,
                         "maximum": MAX_LIMIT
                     }
@@ -426,7 +577,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "scip_callers",
             "description": "who calls X (transitive) — resolve references to their enclosing functions or module",
-            "inputSchema": object_schema(
+            "inputSchema": narrow_object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
@@ -452,7 +603,7 @@ fn tool_definitions() -> Vec<Value> {
         json!({
             "name": "scip_dead",
             "description": "find exports nothing uses — audit before deleting; separates fully unused from file-local symbols",
-            "inputSchema": object_schema(
+            "inputSchema": narrow_object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
@@ -477,27 +628,18 @@ fn tool_definitions() -> Vec<Value> {
                 &["project_root"]
             )
         }),
-        json!({
-            "name": "scip_outline",
-            "description": "Return the definition skeleton for one indexed file.",
-            "inputSchema": object_schema(
-                json!({
-                    "project_root": {
-                        "type": "string",
-                        "description": "Absolute project path"
-                    },
-                    "file": {
-                        "type": "string",
-                        "description": "Project-relative file path"
-                    }
-                }),
-                &["project_root", "file"]
-            )
-        }),
     ]
 }
 
 fn object_schema(properties: Value, required: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required
+    })
+}
+
+fn narrow_object_schema(properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "object",
         "properties": properties,
@@ -506,28 +648,63 @@ fn object_schema(properties: Value, required: &[&str]) -> Value {
     })
 }
 
-fn run_stdio() -> Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let mut server = Server::default();
+fn serve_stdio(input: impl BufRead, mut output: impl Write, profile: Profile) -> Result<()> {
+    let mut server = Server::new(profile);
 
-    for line in stdin.lock().lines() {
+    for line in input.lines() {
         let line = line.context("read stdin")?;
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = server.dispatch_line(&line) {
-            writeln!(stdout, "{response}").context("write stdout")?;
-            stdout.flush().context("flush stdout")?;
+        for message in server.dispatch_messages(&line) {
+            writeln!(output, "{message}").context("write stdout")?;
+            output.flush().context("flush stdout")?;
         }
     }
     Ok(())
 }
 
+fn run_stdio(profile: Profile) -> Result<()> {
+    let stdin = io::stdin();
+    let stdout = io::BufWriter::new(io::stdout().lock());
+    serve_stdio(stdin.lock(), stdout, profile)
+}
+
+fn resolve_profile(
+    arguments: Vec<String>,
+    environment_profile: Option<&str>,
+) -> Result<(Profile, Vec<String>)> {
+    let mut explicit_profile = None;
+    let mut remaining = Vec::new();
+    let mut arguments = arguments.into_iter();
+    while let Some(argument) = arguments.next() {
+        if argument == "--profile" {
+            let value = arguments
+                .next()
+                .context("--profile requires slim or full")?;
+            explicit_profile = Some(Profile::parse(&value)?);
+        } else if let Some(value) = argument.strip_prefix("--profile=") {
+            explicit_profile = Some(Profile::parse(value)?);
+        } else {
+            remaining.push(argument);
+        }
+    }
+    let profile = match explicit_profile {
+        Some(profile) => profile,
+        None => environment_profile
+            .map(Profile::parse)
+            .transpose()?
+            .unwrap_or_default(),
+    };
+    Ok((profile, remaining))
+}
+
 pub fn run() -> Result<()> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    let environment_profile = env::var("CRUX_PROFILE").ok();
+    let (profile, arguments) = resolve_profile(arguments, environment_profile.as_deref())?;
     match arguments.as_slice() {
-        [] => run_stdio(),
+        [] => run_stdio(profile),
         [flag] if flag == "--version" || flag == "-V" => {
             println!("crux {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -543,7 +720,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         _ => {
-            bail!("usage: crux [--version | self-update [--check] | check <absolute-project-root>]")
+            bail!("usage: crux [--profile slim|full] [--version | self-update [--check] | check <absolute-project-root>]")
         }
     }
 }
@@ -587,57 +764,55 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(
             result.text,
-            "## function formatDate src/lib/date.ts:42\nfunction formatDate(input: Date): string — Formats a date for display.\ndef> export function formatDate(input: Date): string {\nsrc/app.ts:40: const label = formatDate(today);\nsrc/lib/date.ts:15: return formatDate(input);"
+            "## date.ts/formatDate().\ndefinition: function src/lib/date.ts:42\nsignature: function formatDate(input: Date): string\nreferences:\nsrc/app.ts:40: const label = formatDate(today);\nsrc/lib/date.ts:15: return formatDate(input);\ncallers:\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)"
         );
     }
 
     #[test]
-    fn scip_callers_filters_imports_and_resolves_enclosing_definitions() {
+    fn scip_map_filters_imports_and_resolves_direct_callers() {
         let project = TestProject::new();
         write_fixture(&project, false);
         let mut server = Server::default();
         let result = server.call_tool(
-            "scip_callers",
+            "scip_map",
             &json!({
                 "project_root": project.root,
-                "name": "formatDate"
+                "names": ["date.ts/formatDate()."]
             }),
         );
 
         assert!(!result.is_error);
-        assert_eq!(
-            result.text,
-            "## callers of function formatDate src/lib/date.ts:42\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)"
-        );
+        assert!(!result.text.contains("src/app.ts:8:"));
+        assert!(!result.text.contains("src/app.ts:12:"));
+        assert!(result.text.contains("<module> src/app.ts (x1)"));
+        assert!(result
+            .text
+            .contains("function formatDateLong src/lib/date.ts:10 (x1)"));
     }
 
     #[test]
-    fn scip_dead_separates_unused_and_file_local_exports_and_skips_parameters() {
+    fn scip_find_unreferenced_returns_only_zero_inbound_symbols() {
         let project = TestProject::new();
         write_fixture(&project, false);
         let mut server = Server::default();
         let result = server.call_tool(
-            "scip_dead",
+            "scip_find",
             &json!({
                 "project_root": project.root,
-                "path_prefix": "src/lib/dead.ts"
+                "name": "*",
+                "unreferenced": true
             }),
         );
         assert!(!result.is_error);
         let output = result.text;
-        assert_eq!(
-            output,
-            "# dead exports (exports_only=true) — dynamic/string-based uses aren't visible to SCIP\nfile-local: function localOnly src/lib/dead.ts:2 (x1 in-file)\ndead: function neverUsed src/lib/dead.ts:11\ndead: constant LIMIT src/lib/dead.ts:18"
-        );
+        assert!(output.contains("dead.ts/neverUsed(). | function | src/lib/dead.ts:11"));
+        assert!(!output.contains("localOnly"));
         assert!(!output.contains("parameter"));
         assert!(!output.contains(" input "));
-        assert!(!output.contains("defaultHelper"));
-        assert!(!output.contains("method run"));
-        assert!(!output.contains("constant helper"));
     }
 
     #[test]
-    fn json_rpc_dispatches_initialize_list_and_tool_call() {
+    fn json_rpc_smoke_runs_initialize_list_find_and_map() {
         let project = TestProject::new();
         write_fixture(&project, false);
         let root = project.root.to_string_lossy();
@@ -658,10 +833,23 @@ mod tests {
                 "id": 3,
                 "method": "tools/call",
                 "params": {
-                    "name": "scip_outline",
+                    "name": "scip_find",
                     "arguments": {
                         "project_root": root,
-                        "file": "src/lib/date.ts"
+                        "name": "formatDate"
+                    }
+                }
+            })
+            .to_string(),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "scip_map",
+                    "arguments": {
+                        "project_root": root,
+                        "names": ["date.ts/formatDate()."]
                     }
                 }
             })
@@ -669,14 +857,16 @@ mod tests {
         ]
         .join("\n");
 
-        let mut server = Server::default();
-        let responses = input
+        let mut output = Vec::new();
+        serve_stdio(std::io::Cursor::new(input), &mut output, Profile::Slim)
+            .expect("stdio exchange");
+        let output = String::from_utf8(output).expect("UTF-8 responses");
+        let responses = output
             .lines()
-            .filter_map(|line| server.dispatch_line(line))
-            .map(|line| serde_json::from_str::<Value>(&line).expect("valid response json"))
+            .map(|line| serde_json::from_str::<Value>(line).expect("valid response json"))
             .collect::<Vec<_>>();
 
-        assert_eq!(responses.len(), 3);
+        assert_eq!(responses.len(), 4);
         assert_eq!(
             responses[0].pointer("/result/protocolVersion"),
             Some(&json!("2024-11-05"))
@@ -689,7 +879,7 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .expect("tools array");
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 5);
         assert_eq!(
             tools
                 .iter()
@@ -697,13 +887,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "scip_index",
+                "scip_find",
                 "scip_map",
-                "scip_search",
-                "scip_def",
-                "scip_refs",
-                "scip_callers",
-                "scip_dead",
-                "scip_outline"
+                "scip_outline",
+                "scip_expand"
             ]
         );
         assert_eq!(
@@ -712,31 +899,175 @@ mod tests {
         );
         assert_eq!(
             responses[2].pointer("/result/content/0/text"),
-            Some(&json!("10 function formatDateLong\n42 function formatDate"))
+            Some(&json!("date.ts/formatDate(). | function | src/lib/date.ts:42 | function formatDate(input: Date): string\ndate.ts/formatDateLong(). | function | src/lib/date.ts:10 | function formatDateLong(input: Date): string"))
+        );
+        assert_eq!(
+            responses[3].pointer("/result/isError"),
+            Some(&Value::Bool(false))
+        );
+        assert!(responses[3]
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.contains("callers:")));
+    }
+
+    #[test]
+    fn initialize_response_uses_profile_instructions() {
+        let required_lead = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely.";
+        for (profile, expansion_hint) in [(Profile::Slim, true), (Profile::Full, false)] {
+            let mut server = Server::new(profile);
+            let response = server
+                .dispatch_line(
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {}
+                    })
+                    .to_string(),
+                )
+                .expect("initialize response");
+            let response: Value = serde_json::from_str(&response).expect("valid response json");
+            let instructions = response
+                .pointer("/result/instructions")
+                .and_then(Value::as_str)
+                .expect("instructions string");
+
+            assert!(instructions.starts_with(required_lead));
+            assert!(instructions.split_whitespace().count() < 120);
+            assert!(instructions.contains("Use scip_find to locate or disambiguate"));
+            assert!(instructions.contains("Use ONE scip_map call for depth"));
+            assert!(instructions.contains("Plain text search is cheaper"));
+            assert!(instructions.contains("at most two index calls before answering"));
+            assert_eq!(instructions.contains("Call scip_expand"), expansion_hint);
+            assert_eq!(
+                response.pointer("/result/capabilities/tools/listChanged"),
+                Some(&json!(true))
+            );
+        }
+    }
+
+    #[test]
+    fn tools_list_json_stays_within_each_profile_budget() {
+        let slim = rpc_success(json!(1), json!({"tools": tool_definitions(false)}));
+        let full = rpc_success(json!(1), json!({"tools": tool_definitions(true)}));
+
+        assert!(
+            slim.len() < 2_000,
+            "slim tools/list JSON is {} characters",
+            slim.len()
+        );
+        assert!(
+            full.len() < 4_000,
+            "full tools/list JSON is {} characters",
+            full.len()
+        );
+        assert!(full.len() > slim.len());
+    }
+
+    #[test]
+    fn scip_expand_reveals_narrow_tools_notifies_once_and_is_idempotent() {
+        let mut server = Server::new(Profile::Slim);
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "scip_expand", "arguments": {}}
+        })
+        .to_string();
+
+        let messages = server.dispatch_messages(&request);
+        assert_eq!(messages.len(), 2);
+        let response: Value = serde_json::from_str(&messages[0]).expect("expand response");
+        assert_eq!(
+            response.pointer("/result/content/0/text"),
+            Some(&json!(EXPANDED_TOOLS))
+        );
+        let notification: Value =
+            serde_json::from_str(&messages[1]).expect("list changed notification");
+        assert_eq!(
+            notification.get("method"),
+            Some(&json!("notifications/tools/list_changed"))
+        );
+        assert!(notification.get("id").is_none());
+
+        let tools = server
+            .dispatch_line(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).to_string())
+            .expect("expanded tools list");
+        let tools: Value = serde_json::from_str(&tools).expect("valid tools response");
+        let names = tools
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .expect("tools array")
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 10);
+        for name in [
+            "scip_search",
+            "scip_def",
+            "scip_refs",
+            "scip_callers",
+            "scip_dead",
+        ] {
+            assert!(names.contains(&name));
+        }
+
+        let messages = server.dispatch_messages(&request);
+        assert_eq!(messages.len(), 1);
+        let response: Value = serde_json::from_str(&messages[0]).expect("second expand response");
+        assert_eq!(
+            response.pointer("/result/content/0/text"),
+            Some(&json!("already expanded"))
         );
     }
 
     #[test]
-    fn initialize_response_includes_non_empty_instructions() {
-        let mut server = Server::default();
+    fn full_profile_advertises_all_tools_from_start() {
+        let mut server = Server::new(Profile::Full);
         let response = server
-            .dispatch_line(
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {}
-                })
-                .to_string(),
-            )
-            .expect("initialize response");
-        let response: Value = serde_json::from_str(&response).expect("valid response json");
-        let instructions = response
-            .pointer("/result/instructions")
-            .and_then(Value::as_str)
-            .expect("instructions string");
+            .dispatch_line(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).to_string())
+            .expect("tools response");
+        let response: Value = serde_json::from_str(&response).expect("valid tools response");
+        assert_eq!(
+            response
+                .pointer("/result/tools")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(10)
+        );
 
-        assert!(!instructions.is_empty());
+        let messages = server.dispatch_messages(
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {"name": "scip_expand", "arguments": {}}
+            })
+            .to_string(),
+        );
+        assert_eq!(messages.len(), 1);
+        let response: Value = serde_json::from_str(&messages[0]).expect("expand response");
+        assert_eq!(
+            response.pointer("/result/content/0/text"),
+            Some(&json!("already expanded"))
+        );
+    }
+
+    #[test]
+    fn profile_flag_overrides_environment_profile() {
+        let (profile, arguments) = resolve_profile(
+            vec!["--profile".to_string(), "slim".to_string()],
+            Some("invalid"),
+        )
+        .expect("valid profiles");
+        assert_eq!(profile, Profile::Slim);
+        assert!(arguments.is_empty());
+
+        let (profile, arguments) =
+            resolve_profile(Vec::new(), Some("full")).expect("valid environment profile");
+        assert_eq!(profile, Profile::Full);
+        assert!(arguments.is_empty());
     }
 
     #[test]
@@ -767,13 +1098,29 @@ mod tests {
         let project = TestProject::new();
         let mut server = Server::default();
         let result = server.call_tool(
-            "scip_search",
+            "scip_find",
             &json!({
                 "project_root": project.root,
-                "query": "format"
+                "name": "format"
             }),
         );
         assert!(result.is_error);
         assert!(result.text.contains("call scip_index first"));
+    }
+
+    #[test]
+    fn absorbed_tool_names_are_not_callable() {
+        let mut server = Server::default();
+        for name in [
+            "scip_search",
+            "scip_def",
+            "scip_refs",
+            "scip_callers",
+            "scip_dead",
+        ] {
+            let result = server.call_tool(name, &json!({}));
+            assert!(result.is_error);
+            assert_eq!(result.text, format!("unknown tool: {name}"));
+        }
     }
 }

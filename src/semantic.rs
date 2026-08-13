@@ -1,4 +1,4 @@
-use crate::render::{display_name, inferred_kind, SourceCache};
+use crate::render::{display_name, inferred_kind, qualified_name, SourceCache};
 use scip::symbol::{is_local_symbol, parse_symbol};
 use scip::types::{
     descriptor, occurrence, symbol_information, Document, Index, Occurrence, SymbolInformation,
@@ -63,6 +63,23 @@ impl SemanticIndex {
 
     pub(crate) fn references_for(&self, symbol: &str) -> Option<&BTreeSet<(String, usize)>> {
         self.reference_sites_by_symbol.get(symbol)
+    }
+
+    pub(crate) fn direct_caller_lines(
+        &self,
+        project_root: &std::path::Path,
+        symbols: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut sources = SourceCache::new(project_root);
+        direct_callers(
+            &self.index,
+            symbols,
+            &self.callable_definitions,
+            &mut sources,
+        )
+        .into_iter()
+        .map(|caller| caller.render(""))
+        .collect()
     }
 }
 
@@ -262,7 +279,11 @@ pub(crate) fn matching_symbol_ids(index: &SemanticIndex, name: &str) -> Matching
     let symbols = all.collect::<Vec<_>>();
     let mut matches = symbols
         .iter()
-        .filter(|information| display_name(information) == name)
+        .filter(|information| {
+            display_name(information) == name
+                || qualified_name(information) == name
+                || information.symbol == name
+        })
         .map(|information| information.symbol.clone())
         .collect::<HashSet<_>>();
     let exact_match = !matches.is_empty();

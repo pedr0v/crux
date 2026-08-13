@@ -66,18 +66,59 @@ No other step is necessary. The agent creates the index automatically on first u
 
 The server sends tool descriptions and instructions through the MCP protocol. Agents such as Claude Code and Codex read this information automatically. The user does not write a prompt.
 
+## Profiles
+
+The `slim` profile is the default. It advertises the four consolidated tools and `scip_expand`.
+Call `scip_expand` when an agent needs a finer-grained tool. The call adds five narrow tools and sends an MCP tool-list change notification.
+
+Start crux with the complete tool surface when you need it immediately:
+
+```sh
+crux --profile full
+```
+
+You can also set `CRUX_PROFILE=full`. The `--profile` flag overrides the environment variable.
+The `full` profile still advertises `scip_expand`. The tool returns `already expanded` in this profile.
+
 ## Tools
 
 | Tool | Function |
 | --- | --- |
 | `scip_index` | Finds the project language. Creates or refreshes the SCIP index. |
-| `scip_map` | Shows definitions, signatures, and reference sites for a maximum of eight symbols in one call. |
+| `scip_find` | Finds symbol candidates by name. It can find unreferenced symbols. |
+| `scip_map` | Shows definitions, signatures, reference sites, and callers for a maximum of eight known symbols. |
+| `scip_outline` | Shows the definition structure of one file. |
+| `scip_expand` | Adds the narrow tools to a slim server session. |
+
+The `full` profile and `scip_expand` add these narrow tools:
+
+| Tool | Function |
+| --- | --- |
 | `scip_search` | Finds symbols by name. Shows compact matches. |
 | `scip_def` | Shows definitions with signatures, documentation, and source lines. |
-| `scip_refs` | Shows the reference lines for one symbol, in groups by file. |
-| `scip_outline` | Shows the definition structure of one file. |
+| `scip_refs` | Shows reference lines for one symbol, in groups by file. |
 | `scip_callers` | Shows the direct or transitive callers of one function. |
-| `scip_dead` | Shows the exports that have no references in other files. Use it before you delete code. |
+| `scip_dead` | Shows exports with no references in other files. Use it before you delete code. |
+
+## Migration to 0.6.0
+
+Version 0.6.0 uses the four consolidated tools by default. The narrow tools remain available through `scip_expand` or the `full` profile.
+
+| Old call | New call |
+| --- | --- |
+| `scip_index { project_root, language?, max_file_mb? }` | Unchanged. |
+| `scip_search { project_root, query, limit? }` | `scip_find { project_root, name: query, limit? }` |
+| `scip_def { project_root, name }` | `scip_find { project_root, name }` |
+| `scip_refs { project_root, name, limit? }` | Run `scip_find`, then `scip_map { project_root, names: [qualified_name], ref_limit: limit? }`. |
+| `scip_callers { project_root, name, depth?, limit? }` | Run `scip_find`, then use the same `scip_map` shape. |
+| `scip_dead { project_root, path_prefix?, limit?, exports_only? }` | `scip_find { project_root, name: "*", unreferenced: true, limit? }` |
+| `scip_map { project_root, names, refs_limit? }` | `scip_map { project_root, names, ref_limit? }` |
+| `scip_outline { project_root, file }` | Unchanged. |
+
+`scip_map` no longer accepts `context` or `include_imports`.
+The new map filters import and re-export sites.
+It reports direct callers and has no caller depth option.
+The unreferenced query has no path or export filter.
 
 ## Language support
 
