@@ -882,7 +882,7 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(
             result.text,
-            "resolved formatDate → date.ts/formatDate().\n## date.ts/formatDate().\ndefinition: function src/lib/date.ts:42\nsignature: function formatDate(input: Date): string\nreferences:\nsrc/app.ts:40: const label = formatDate(today);\nsrc/lib/date.ts:15: return formatDate(input);\ncallers:\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)"
+            "resolved formatDate → date.ts/formatDate().\n## date.ts/formatDate().\ndefinition: function src/lib/date.ts:42\nsignature: function formatDate(input: Date): string\nreferences:\nsrc/app.ts:40: const label = formatDate(today);\nsrc/lib/date.ts:15: return formatDate(input);\ncallers:\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)\ncallers: <module> src/app.ts; formatDateLong\nfiles: src/app.ts; src/lib/date.ts"
         );
     }
 

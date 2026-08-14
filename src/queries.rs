@@ -232,6 +232,7 @@ pub(crate) fn callers(
     }
 
     let mut lines = Vec::new();
+    let mut compact_insertions = Vec::new();
     for (file, line, symbol, information) in matches {
         lines.push(format!(
             "## callers of {} {} {file}:{}",
@@ -247,19 +248,37 @@ pub(crate) fn callers(
             limit,
             seen_symbols: HashSet::new(),
             lines: Vec::new(),
+            enumeration_names: Vec::new(),
+            truncated: false,
         };
         walk.render_symbols(&symbols.reference_symbols(&symbol), depth, 0);
+        let enumeration_names = walk.enumeration_names;
+        let truncated = walk.truncated;
         lines.append(&mut walk.lines);
         if lines.len() == before {
             lines.push("no callers".to_string());
         }
+        let mut compact_lines = Vec::new();
+        append_compact_enumeration(&mut compact_lines, "callers", enumeration_names, truncated);
+        if let Some(compact_line) = compact_lines.pop() {
+            compact_insertions.push((lines.len(), compact_line));
+        }
     }
 
+    let visible_line_count;
     if lines.len() > MAX_MAP_RESULT_LINES {
         let shown = MAX_MAP_RESULT_LINES - 1;
         let omitted = lines.len() - shown;
         lines.truncate(shown);
         lines.push(format!("… +{omitted} more lines"));
+        visible_line_count = shown;
+    } else {
+        visible_line_count = lines.len();
+    }
+    for (position, compact_line) in compact_insertions.into_iter().rev() {
+        if position <= visible_line_count {
+            lines.insert(position, compact_line);
+        }
     }
     Ok(lines.join("\n"))
 }
@@ -666,6 +685,22 @@ fn append_limited_section(
     }
 }
 
+fn append_compact_enumeration(
+    lines: &mut Vec<String>,
+    heading: &str,
+    mut entries: Vec<String>,
+    truncated: bool,
+) {
+    entries.sort();
+    entries.dedup();
+    if entries.is_empty() {
+        return;
+    }
+
+    let marker = if truncated { " (truncated)" } else { "" };
+    lines.push(format!("{heading}: {}{marker}", entries.join("; ")));
+}
+
 pub(crate) fn map_symbols(
     project_root: &Path,
     index: &SemanticIndex,
@@ -762,10 +797,12 @@ pub(crate) fn map_symbols(
             .flat_map(|sites| sites.iter().cloned())
             .collect::<BTreeSet<_>>();
         let mut references = Vec::new();
+        let mut reference_files = Vec::new();
         for (reference_file, reference_line) in reference_sites {
             if sources.is_import_or_export(&reference_file, reference_line) {
                 continue;
             }
+            reference_files.push(reference_file.clone());
             let prefix = format!("{reference_file}:{}", reference_line + 1);
             references.push(
                 match sources.display_line(&reference_file, reference_line) {
@@ -774,10 +811,21 @@ pub(crate) fn map_symbols(
                 },
             );
         }
+        let references_truncated = references.len() > ref_limit;
+        let reference_files = reference_files.into_iter().take(ref_limit).collect();
         append_limited_section(&mut lines, "references", references, ref_limit);
 
-        let callers = index.direct_caller_lines(project_root, &reference_symbols);
-        append_limited_section(&mut lines, "callers", callers, ref_limit);
+        let callers = index.direct_caller_entries(project_root, &reference_symbols);
+        let callers_truncated = callers.len() > ref_limit;
+        let caller_names = callers
+            .iter()
+            .take(ref_limit)
+            .map(|(_, name)| name.clone())
+            .collect();
+        let caller_lines = callers.into_iter().map(|(line, _)| line).collect();
+        append_limited_section(&mut lines, "callers", caller_lines, ref_limit);
+        append_compact_enumeration(&mut lines, "callers", caller_names, callers_truncated);
+        append_compact_enumeration(&mut lines, "files", reference_files, references_truncated);
     }
     resolutions.extend(lines);
     Ok(resolutions.join("\n"))
@@ -807,8 +855,13 @@ pub(crate) fn references(index: &SemanticIndex, name: &str, limit: usize) -> Res
     }
 
     let total = locations.len();
+    let shown_locations = locations.into_iter().take(limit).collect::<Vec<_>>();
+    let files = shown_locations
+        .iter()
+        .map(|(file, _)| file.clone())
+        .collect();
     let mut grouped: BTreeMap<String, Vec<usize>> = BTreeMap::new();
-    for (file, line) in locations.into_iter().take(limit) {
+    for (file, line) in shown_locations {
         grouped.entry(file).or_default().push(line);
     }
     let rendered = grouped
@@ -830,6 +883,7 @@ pub(crate) fn references(index: &SemanticIndex, name: &str, limit: usize) -> Res
             "{omitted} more reference sites; raise limit to see them."
         ));
     }
+    append_compact_enumeration(&mut lines, "files", files, omitted > 0);
     Ok(lines.join("\n"))
 }
 
@@ -950,6 +1004,33 @@ mod tests {
                 .count(),
             2
         );
+        assert!(mapped.contains("callers: <module> src/app.ts (truncated)"));
+        assert!(mapped.contains("files: src/app.ts (truncated)"));
+
+        let mapped = map_symbols(
+            &project.root,
+            &index,
+            &["date.ts/formatDate().".to_string()],
+            DEFAULT_MAP_REFS_LIMIT,
+        )
+        .expect("uncapped qualified map");
+        assert!(mapped.contains("callers: <module> src/app.ts; formatDateLong"));
+        assert!(mapped.contains("files: src/app.ts; src/lib/date.ts"));
+    }
+
+    #[test]
+    fn scip_map_omits_empty_enumerations() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let output = map_symbols(
+            &project.root,
+            &SemanticIndex::new(fixture(false)),
+            &["neverUsed".to_string()],
+            DEFAULT_MAP_REFS_LIMIT,
+        )
+        .expect("empty map");
+        assert!(!output.lines().any(|line| line.starts_with("callers: ")));
+        assert!(!output.lines().any(|line| line.starts_with("files: ")));
     }
 
     #[test]
@@ -1144,7 +1225,9 @@ mod tests {
         assert!(output.ends_with("7 more reference sites; raise refs_limit to see them."));
 
         let refs = references(&index, "formatDate", DEFAULT_REFS_LIMIT).expect("large refs");
-        assert!(refs.ends_with("9 more reference sites; raise limit to see them."));
+        assert!(refs.ends_with(
+            "9 more reference sites; raise limit to see them.\nfiles: src/app.ts; src/lib/date.ts; src/many.ts (truncated)"
+        ));
         assert!(!refs.contains("src/many.ts: 17"));
     }
 
@@ -1170,8 +1253,24 @@ mod tests {
             references(&SemanticIndex::new(fixture(true)), "formatDate", 2).expect("references");
         assert_eq!(
             output,
-            "src/app.ts: 8, 12\n3 more reference sites; raise limit to see them."
+            "src/app.ts: 8, 12\n3 more reference sites; raise limit to see them.\nfiles: src/app.ts (truncated)"
         );
+
+        let output = references(
+            &SemanticIndex::new(fixture(false)),
+            "formatDate",
+            DEFAULT_REFS_LIMIT,
+        )
+        .expect("uncapped references");
+        assert!(output.ends_with("files: src/app.ts; src/lib/date.ts"));
+
+        let output = references(
+            &SemanticIndex::new(fixture(false)),
+            "neverUsed",
+            DEFAULT_REFS_LIMIT,
+        )
+        .expect("empty references");
+        assert_eq!(output, "no references");
     }
 
     #[test]
@@ -1188,8 +1287,22 @@ mod tests {
         .expect("transitive callers");
         assert_eq!(
             output,
-            "## callers of function formatDate src/lib/date.ts:42\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)\n  <module> src/app.ts (x1)"
+            "## callers of function formatDate src/lib/date.ts:42\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)\n  <module> src/app.ts (x1)\ncallers: <module> src/app.ts; formatDateLong"
         );
+    }
+
+    #[test]
+    fn scip_callers_marks_truncation_and_omits_empty_enumerations() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let index = SemanticIndex::new(fixture(false));
+        let output = callers(&project.root, &index, "formatDate", 1, 1).expect("limited callers");
+        assert!(output.ends_with("callers: <module> src/app.ts (truncated)"));
+
+        let output = callers(&project.root, &index, "neverUsed", 1, DEFAULT_CALLERS_LIMIT)
+            .expect("empty callers");
+        assert!(output.contains("no callers"));
+        assert!(!output.lines().any(|line| line.starts_with("callers: ")));
     }
 
     #[test]

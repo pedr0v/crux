@@ -65,11 +65,11 @@ impl SemanticIndex {
         self.reference_sites_by_symbol.get(symbol)
     }
 
-    pub(crate) fn direct_caller_lines(
+    pub(crate) fn direct_caller_entries(
         &self,
         project_root: &std::path::Path,
         symbols: &HashSet<String>,
-    ) -> Vec<String> {
+    ) -> Vec<(String, String)> {
         let mut sources = SourceCache::new(project_root);
         direct_callers(
             &self.index,
@@ -78,7 +78,7 @@ impl SemanticIndex {
             &mut sources,
         )
         .into_iter()
-        .map(|caller| caller.render(""))
+        .map(|caller| (caller.render(""), caller.enumeration_name()))
         .collect()
     }
 }
@@ -570,6 +570,13 @@ impl Caller {
             None => format!("{indent}<module> {} (x{})", self.file, self.count),
         }
     }
+
+    fn enumeration_name(&self) -> String {
+        match self.line {
+            Some(_) => self.name.clone(),
+            None => format!("<module> {}", self.file),
+        }
+    }
 }
 
 fn resolve_caller(definitions: &[CallableDefinition], file: &str, reference_line: usize) -> Caller {
@@ -658,6 +665,8 @@ pub(crate) struct CallerWalk<'a> {
     pub(crate) limit: usize,
     pub(crate) seen_symbols: HashSet<String>,
     pub(crate) lines: Vec<String>,
+    pub(crate) enumeration_names: Vec<String>,
+    pub(crate) truncated: bool,
 }
 
 impl CallerWalk<'_> {
@@ -679,6 +688,7 @@ impl CallerWalk<'_> {
             if !should_render {
                 continue;
             }
+            self.enumeration_names.push(caller.enumeration_name());
             self.lines.push(caller.render(&indent));
             if remaining_depth > 1 {
                 if let CallerIdentity::Symbol(symbol) = &caller.identity {
@@ -692,6 +702,7 @@ impl CallerWalk<'_> {
         }
 
         if total > self.limit {
+            self.truncated = true;
             self.lines
                 .push(format!("{indent}… +{} more", total - self.limit));
         }
