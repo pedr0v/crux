@@ -9,6 +9,11 @@ use std::process::{Command, Output};
 const BEGIN_MARKER: &str = "# --- crux begin ---";
 const END_MARKER: &str = "# --- crux end ---";
 const ADOPTION_BODY: &str = "## crux code index\n\nThis project may have a crux code index.\n\nWho calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely.\n\nPlain text search is cheaper for a simple 'where is X defined' question.";
+const CODEX_REQUIRED_KEYS: [(&str, &str); 3] = [
+    ("required", "required = true"),
+    ("startup_timeout_sec", "startup_timeout_sec = 30"),
+    ("omit_tools_from", "omit_tools_from = [\"deferred\"]"),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Client {
@@ -31,6 +36,13 @@ struct MarkerSpan {
     start: usize,
     end: usize,
     newline: &'static str,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TomlTableSpan {
+    start: usize,
+    body_start: usize,
+    end: usize,
 }
 
 #[derive(Debug)]
@@ -98,18 +110,11 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 fn setup_codex(home: &Path, project: Option<&Path>, current_exe: &Path) -> Result<()> {
-    let config = home.join(".codex/config.toml");
-    let existing = read_optional_utf8(&config)?;
-    if has_external_codex_table(&existing)? {
-        println!(
-            "Left {} unchanged: [mcp_servers.crux] exists outside crux markers.",
-            config.display()
-        );
-    } else {
-        let block = codex_server_body(current_exe)?;
-        let report = edit_file(&config, |content| insert_or_replace(content, &block))?;
-        print_edit(&config, &report, "registered the crux MCP server");
-    }
+    let config = codex_config_path(home);
+    let report = edit_file(&config, |content| {
+        install_codex_config(content, current_exe)
+    })?;
+    print_edit(&config, &report, "configured the crux MCP server");
 
     let instructions = instruction_path(home, project, Client::Codex);
     let report = edit_file(&instructions, |content| {
@@ -120,9 +125,9 @@ fn setup_codex(home: &Path, project: Option<&Path>, current_exe: &Path) -> Resul
 }
 
 fn unsetup_codex(home: &Path, project: Option<&Path>) -> Result<()> {
-    let config = home.join(".codex/config.toml");
+    let config = codex_config_path(home);
     let report = edit_file(&config, remove_marker_block)?;
-    print_removal(&config, &report, "crux MCP server registration");
+    print_removal(&config, &report, "crux MCP server configuration");
 
     let instructions = instruction_path(home, project, Client::Codex);
     let report = edit_file(&instructions, remove_marker_block)?;
@@ -200,6 +205,14 @@ fn instruction_path(home: &Path, project: Option<&Path>, client: Client) -> Path
     }
 }
 
+fn codex_config_path(home: &Path) -> PathBuf {
+    env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".codex"))
+        .join("config.toml")
+}
+
 fn codex_server_body(current_exe: &Path) -> Result<String> {
     if !current_exe.is_absolute() {
         bail!(
@@ -210,23 +223,133 @@ fn codex_server_body(current_exe: &Path) -> Result<String> {
     let command = serde_json::to_string(&current_exe.to_string_lossy())
         .context("encode the current executable path")?;
     Ok(format!(
-        "[mcp_servers.crux]\ncommand = {command}\nargs = []"
+        "[mcp_servers.crux]\ncommand = {command}\nargs = []\n{}",
+        CODEX_REQUIRED_KEYS
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n")
     ))
 }
 
-fn has_external_codex_table(content: &str) -> Result<bool> {
-    let content_without_markers = match marker_span(content)? {
-        Some(span) => format!("{}{}", &content[..span.start], &content[span.end..]),
-        None => content.to_string(),
+fn install_codex_config(content: &str, current_exe: &Path) -> Result<String> {
+    let marker = marker_span(content)?;
+    let Some(table) = codex_table_span(content)? else {
+        if marker.is_some() {
+            bail!("found crux markers without an [mcp_servers.crux] section");
+        }
+        return insert_or_replace(content, &codex_server_body(current_exe)?);
     };
-    Ok(content_without_markers.lines().any(|line| {
-        let compact = line
-            .trim()
-            .chars()
-            .filter(|character| !matches!(character, ' ' | '\t'))
-            .collect::<String>();
-        compact == "[mcp_servers.crux]" || compact.starts_with("[mcp_servers.crux]#")
-    }))
+
+    let missing = missing_codex_keys(&content[table.body_start..table.end]);
+    if missing.is_empty() {
+        return Ok(content.to_string());
+    }
+    let body = missing.join("\n");
+
+    if let Some(marker) = marker {
+        if marker.start > table.end || marker.end < table.start {
+            bail!("found crux markers outside the [mcp_servers.crux] section");
+        }
+        return insert_into_marker_block(content, &marker, &body);
+    }
+
+    Ok(insert_marker_block_at(content, table.end, &body))
+}
+
+fn codex_table_span(content: &str) -> Result<Option<TomlTableSpan>> {
+    let mut target: Option<TomlTableSpan> = None;
+    let mut offset = 0;
+
+    for line in content.split_inclusive('\n') {
+        let line_end = offset + line.len();
+        if let Some(name) = toml_table_name(line) {
+            if let Some(table) = target.as_mut() {
+                if table.end == content.len() {
+                    table.end = offset;
+                }
+            }
+            if compact_toml_name(name) == "mcp_servers.crux" {
+                if target.is_some() {
+                    bail!("found duplicate [mcp_servers.crux] sections");
+                }
+                target = Some(TomlTableSpan {
+                    start: offset,
+                    body_start: line_end,
+                    end: content.len(),
+                });
+            }
+        }
+        offset = line_end;
+    }
+
+    Ok(target)
+}
+
+fn toml_table_name(line: &str) -> Option<&str> {
+    let line = line.trim_end_matches(['\r', '\n']).trim();
+    if !line.starts_with('[') {
+        return None;
+    }
+    let closing = line.find(']')?;
+    let suffix = line[closing + 1..].trim_start();
+    if !suffix.is_empty() && !suffix.starts_with('#') {
+        return None;
+    }
+    let name = &line[1..closing];
+    if name.starts_with('[') || name.ends_with(']') {
+        return Some("");
+    }
+    Some(name.trim())
+}
+
+fn compact_toml_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| !matches!(character, ' ' | '\t'))
+        .collect()
+}
+
+fn missing_codex_keys(table_body: &str) -> Vec<&'static str> {
+    CODEX_REQUIRED_KEYS
+        .iter()
+        .filter_map(|(key, line)| (!toml_key_exists(table_body, key)).then_some(*line))
+        .collect()
+}
+
+fn toml_key_exists(table_body: &str, key: &str) -> bool {
+    table_body.lines().any(|line| {
+        let line = line.trim_start();
+        line.strip_prefix(key)
+            .is_some_and(|suffix| suffix.trim_start().starts_with('='))
+    })
+}
+
+fn insert_into_marker_block(content: &str, marker: &MarkerSpan, body: &str) -> Result<String> {
+    let end_marker_start = marker
+        .end
+        .checked_sub(END_MARKER.len())
+        .context("find the crux end marker")?;
+    let body = body.replace('\n', marker.newline);
+    Ok(format!(
+        "{}{}{}{}",
+        &content[..end_marker_start],
+        body,
+        marker.newline,
+        &content[end_marker_start..]
+    ))
+}
+
+fn insert_marker_block_at(content: &str, offset: usize, body: &str) -> String {
+    let newline = preferred_newline(content);
+    let block = render_block(body, newline);
+    format!(
+        "{}{}{}{}{}",
+        &content[..offset],
+        newline,
+        block,
+        newline,
+        &content[offset..]
+    )
 }
 
 fn insert_or_replace(content: &str, body: &str) -> Result<String> {
@@ -550,6 +673,9 @@ mod tests {
         let encoded = serde_json::to_string(&current_exe.to_string_lossy()).expect("encoded path");
         assert!(body.contains(&format!("command = {encoded}")));
         assert!(body.contains("args = []"));
+        assert!(body.contains("required = true"));
+        assert!(body.contains("startup_timeout_sec = 30"));
+        assert!(body.contains("omit_tools_from = [\"deferred\"]"));
     }
 
     #[test]
@@ -568,13 +694,59 @@ mod tests {
     }
 
     #[test]
-    fn external_codex_table_is_detected_outside_our_markers() {
-        let managed = insert_or_replace("title = 'user'", "[mcp_servers.crux]\ncommand = '/crux'")
-            .expect("managed block");
-        assert!(!has_external_codex_table(&managed).expect("managed table check"));
+    fn fresh_codex_config_creates_a_complete_managed_section() {
+        let current_exe = env::current_exe().expect("current test executable");
+        let original = "model = \"gpt-5\"\n";
+        let installed = install_codex_config(original, &current_exe).expect("install config");
+        let encoded = serde_json::to_string(&current_exe.to_string_lossy()).expect("encoded path");
 
-        let external = format!("[mcp_servers.crux]\ncommand = '/user'\n{managed}");
-        assert!(has_external_codex_table(&external).expect("external table check"));
+        assert_eq!(
+            installed,
+            format!(
+                "model = \"gpt-5\"\n\n{BEGIN_MARKER}\n[mcp_servers.crux]\ncommand = {encoded}\nargs = []\nrequired = true\nstartup_timeout_sec = 30\nomit_tools_from = [\"deferred\"]\n{END_MARKER}\n"
+            )
+        );
+        assert_eq!(
+            install_codex_config(&installed, &current_exe).expect("repeat config install"),
+            installed
+        );
+    }
+
+    #[test]
+    fn existing_codex_section_adds_only_the_missing_key() {
+        let current_exe = env::current_exe().expect("current test executable");
+        let original = "model = \"gpt-5\"\n\n[mcp_servers.crux]\ncommand = \"/user/crux\"\nargs = [\"--profile\", \"full\"]\nrequired = false\nstartup_timeout_sec = 7\n\n[features]\napps = true\n";
+        let installed = install_codex_config(original, &current_exe).expect("install config");
+
+        assert_eq!(
+            installed,
+            "model = \"gpt-5\"\n\n[mcp_servers.crux]\ncommand = \"/user/crux\"\nargs = [\"--profile\", \"full\"]\nrequired = false\nstartup_timeout_sec = 7\n\n\n# --- crux begin ---\nomit_tools_from = [\"deferred\"]\n# --- crux end ---\n[features]\napps = true\n"
+        );
+        assert_eq!(installed.matches("required =").count(), 1);
+        assert_eq!(installed.matches("startup_timeout_sec =").count(), 1);
+        assert_eq!(installed.matches("omit_tools_from =").count(), 1);
+        assert!(installed.contains("command = \"/user/crux\""));
+        assert!(installed.contains("args = [\"--profile\", \"full\"]"));
+        assert_eq!(
+            install_codex_config(&installed, &current_exe).expect("repeat config install"),
+            installed
+        );
+    }
+
+    #[test]
+    fn codex_config_unsetup_restores_created_and_extended_sections() {
+        let current_exe = env::current_exe().expect("current test executable");
+        let originals = [
+            "model = \"gpt-5\"\n",
+            "[mcp_servers.crux]\r\ncommand = \"C:\\\\crux.exe\"\r\nargs = []\r\nrequired = true\r\nstartup_timeout_sec = 30\r\n",
+        ];
+
+        for original in originals {
+            let installed =
+                install_codex_config(original, &current_exe).expect("install config fixture");
+            let restored = remove_marker_block(&installed).expect("unsetup config fixture");
+            assert_eq!(restored, original);
+        }
     }
 
     #[test]
