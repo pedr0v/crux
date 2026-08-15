@@ -286,7 +286,10 @@ mod tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        assert_eq!(format_limited(lines, 2), "a\nb\n… +2 more");
+        assert_eq!(
+            format_limited(lines, 2, 0),
+            "a\nb\n… 2 more (pass offset=2)"
+        );
         assert_eq!(truncate_chars("abcdef", 4), "abc…");
     }
 }

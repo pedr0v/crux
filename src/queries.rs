@@ -13,12 +13,15 @@ use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-const MAX_RESULT_LINES: usize = 39;
 pub(crate) const MAX_MAP_NAMES: usize = 8;
 const MAX_MAP_RESULT_LINES: usize = 250;
+const AMBIGUITY_LIMIT: usize = 10;
+const GROUPED_REFERENCE_THRESHOLD: usize = 30;
 
 struct SymbolCandidate {
     rank: usize,
+    reference_count: usize,
+    display_name: String,
     qualified_name: String,
     kind: String,
     file: String,
@@ -39,6 +42,20 @@ impl SymbolCandidate {
             self.qualified_name,
             self.kind,
             self.file,
+            self.line + 1
+        )
+    }
+
+    fn render_grouped(&self) -> String {
+        let signature = if self.signature.is_empty() {
+            "-"
+        } else {
+            &self.signature
+        };
+        format!(
+            "- {} | {} | line {} | {signature}",
+            self.qualified_name,
+            self.kind,
             self.line + 1
         )
     }
@@ -104,6 +121,10 @@ fn symbol_candidates(
         }
         candidates.push(SymbolCandidate {
             rank,
+            reference_count: index
+                .references_for(&information.symbol)
+                .map_or(0, BTreeSet::len),
+            display_name: display,
             qualified_name: qualified,
             kind: inferred_kind(information),
             file,
@@ -113,30 +134,71 @@ fn symbol_candidates(
         });
     }
 
-    candidates.sort_by(|left, right| {
-        (
-            &left.rank,
-            &left.qualified_name,
-            &left.file,
-            &left.line,
-            &left.symbol,
-        )
-            .cmp(&(
-                &right.rank,
-                &right.qualified_name,
-                &right.file,
-                &right.line,
-                &right.symbol,
-            ))
-    });
+    rank_candidates(&mut candidates);
     candidates.dedup_by(|left, right| left.symbol == right.symbol);
     Ok(candidates)
+}
+
+fn rank_candidates(candidates: &mut [SymbolCandidate]) {
+    candidates.sort_by(|left, right| {
+        left.rank
+            .cmp(&right.rank)
+            .then_with(|| right.reference_count.cmp(&left.reference_count))
+            .then_with(|| left.qualified_name.cmp(&right.qualified_name))
+            .then_with(|| left.file.cmp(&right.file))
+            .then_with(|| left.line.cmp(&right.line))
+            .then_with(|| left.symbol.cmp(&right.symbol))
+    });
+}
+
+fn ambiguity_candidate_lines(
+    heading: String,
+    candidates: Vec<SymbolCandidate>,
+) -> Option<Vec<String>> {
+    if candidates.len() < 2 {
+        return None;
+    }
+
+    let total = candidates.len();
+    let mut groups: Vec<(String, Vec<&SymbolCandidate>)> = Vec::new();
+    for candidate in candidates.iter().take(AMBIGUITY_LIMIT) {
+        if let Some((_, entries)) = groups.iter_mut().find(|(file, _)| file == &candidate.file) {
+            entries.push(candidate);
+        } else {
+            groups.push((candidate.file.clone(), vec![candidate]));
+        }
+    }
+
+    let mut lines = vec![heading];
+    for (file, candidates) in groups {
+        lines.push(format!("{file}:"));
+        lines.extend(candidates.into_iter().map(SymbolCandidate::render_grouped));
+    }
+    if total > AMBIGUITY_LIMIT {
+        lines.push(format!(
+            "… {} more candidates; pass a qualified name (scip_find name offset={} limit={} to page)",
+            total - AMBIGUITY_LIMIT,
+            AMBIGUITY_LIMIT,
+            AMBIGUITY_LIMIT
+        ));
+    }
+    Some(lines)
+}
+
+fn dominant_candidate<'a>(name: &str, candidates: &'a [SymbolCandidate]) -> Option<&'a str> {
+    let [first, second, ..] = candidates else {
+        return None;
+    };
+    let uniquely_outranks = first.rank < second.rank
+        || (first.rank == second.rank && first.reference_count > second.reference_count);
+    (first.display_name == name && uniquely_outranks).then_some(first.symbol.as_str())
 }
 
 pub(crate) fn find(
     index: &SemanticIndex,
     name: &str,
     limit: usize,
+    offset: usize,
     unreferenced: bool,
 ) -> Result<String> {
     let candidates = symbol_candidates(index, name, unreferenced)?;
@@ -147,11 +209,16 @@ pub(crate) fn find(
 
     let mut lines = candidates
         .into_iter()
+        .skip(offset)
         .take(limit)
         .map(|candidate| candidate.render())
         .collect::<Vec<_>>();
-    if total > limit {
-        lines.push(format!("… {} more; raise limit", total - limit));
+    let next_offset = offset.saturating_add(lines.len());
+    if next_offset < total {
+        lines.push(format!(
+            "… {} more (pass offset={next_offset})",
+            total - next_offset
+        ));
     }
     Ok(lines.join("\n"))
 }
@@ -161,32 +228,13 @@ fn ambiguity_lines(
     name: &str,
     symbols: &MatchingSymbols,
 ) -> Option<Vec<String>> {
-    let mut candidates = symbols
-        .principals
-        .iter()
-        .filter_map(|symbol| {
-            let information = index.information(symbol)?;
-            let (file, _) = index.definition_site(symbol)?;
-            Some((
-                qualified_name(information),
-                inferred_kind(information),
-                file.clone(),
-            ))
-        })
+    let mut candidates = symbol_candidates(index, name, false)
+        .ok()?
+        .into_iter()
+        .filter(|candidate| symbols.principals.contains(&candidate.symbol))
         .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.dedup();
-    if candidates.len() < 2 {
-        return None;
-    }
-
-    let mut lines = vec![format!("ambiguous: {name}")];
-    lines.extend(
-        candidates
-            .into_iter()
-            .map(|(qualified, kind, file)| format!("- {qualified} | {kind} | {file}")),
-    );
-    Some(lines)
+    rank_candidates(&mut candidates);
+    ambiguity_candidate_lines(format!("ambiguous: {name}"), candidates)
 }
 
 fn ambiguity_response(
@@ -194,9 +242,7 @@ fn ambiguity_response(
     name: &str,
     symbols: &MatchingSymbols,
 ) -> Option<String> {
-    let mut lines = ambiguity_lines(index, name, symbols)?;
-    lines.push("specify the qualified name".to_string());
-    Some(lines.join("\n"))
+    Some(ambiguity_lines(index, name, symbols)?.join("\n"))
 }
 
 pub(crate) fn callers(
@@ -265,16 +311,15 @@ pub(crate) fn callers(
         }
     }
 
-    let visible_line_count;
-    if lines.len() > MAX_MAP_RESULT_LINES {
+    let visible_line_count = if lines.len() > MAX_MAP_RESULT_LINES {
         let shown = MAX_MAP_RESULT_LINES - 1;
         let omitted = lines.len() - shown;
         lines.truncate(shown);
         lines.push(format!("… +{omitted} more lines"));
-        visible_line_count = shown;
+        shown
     } else {
-        visible_line_count = lines.len();
-    }
+        lines.len()
+    };
     for (position, compact_line) in compact_insertions.into_iter().rev() {
         if position <= visible_line_count {
             lines.insert(position, compact_line);
@@ -422,17 +467,37 @@ pub(crate) fn dead_exports(
     Ok(lines.join("\n"))
 }
 
-pub(crate) fn format_limited(lines: Vec<String>, limit: usize) -> String {
+fn format_limited_output(
+    lines: Vec<String>,
+    limit: usize,
+    offset: usize,
+    paginated: bool,
+) -> String {
     let total = lines.len();
     if total == 0 {
         return "no matches".to_string();
     }
-    let shown = total.min(limit);
-    let mut output = lines.into_iter().take(shown).collect::<Vec<_>>();
-    if shown < total {
-        output.push(format!("… +{} more", total - shown));
+    let mut output = lines
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_offset = offset.saturating_add(output.len());
+    if next_offset < total {
+        if paginated {
+            output.push(format!(
+                "… {} more (pass offset={next_offset})",
+                total - next_offset
+            ));
+        } else {
+            output.push(format!("… +{} more", total - next_offset));
+        }
     }
     output.join("\n")
+}
+
+pub(crate) fn format_limited(lines: Vec<String>, limit: usize, offset: usize) -> String {
+    format_limited_output(lines, limit, offset, true)
 }
 
 pub(crate) fn search(index: &SemanticIndex, query: &str, limit: usize) -> Result<String> {
@@ -476,9 +541,11 @@ pub(crate) fn search(index: &SemanticIndex, query: &str, limit: usize) -> Result
     hits.sort_by(|left, right| {
         (&left.0, &left.1, &left.2, &left.3).cmp(&(&right.0, &right.1, &right.2, &right.3))
     });
-    Ok(format_limited(
+    Ok(format_limited_output(
         hits.into_iter().map(|hit| hit.4).collect(),
         limit,
+        0,
+        false,
     ))
 }
 
@@ -561,13 +628,12 @@ pub(crate) fn map_bundle(
         .iter()
         .map(|name| (name, matching_symbol_ids(index, name)))
         .collect::<Vec<_>>();
-    let mut ambiguities = matches_by_name
+    let ambiguities = matches_by_name
         .iter()
         .filter_map(|(name, symbols)| ambiguity_lines(index, name, symbols))
         .flatten()
         .collect::<Vec<_>>();
     if !ambiguities.is_empty() {
-        ambiguities.push("specify the qualified name".to_string());
         return Ok(ambiguities.join("\n"));
     }
 
@@ -658,9 +724,7 @@ pub(crate) fn map_bundle(
 
             let omitted = total_references.saturating_sub(refs_limit);
             if omitted > 0 {
-                lines.push(format!(
-                    "{omitted} more reference sites; raise refs_limit to see them."
-                ));
+                lines.push(format!("… {omitted} more (pass offset={refs_limit})"));
             }
         }
     }
@@ -671,18 +735,25 @@ fn append_limited_section(
     lines: &mut Vec<String>,
     heading: &str,
     entries: Vec<String>,
+    total: usize,
     limit: usize,
-) {
-    let total = entries.len();
+    offset: usize,
+) -> bool {
     lines.push(format!("{heading}:"));
     if total == 0 {
         lines.push("none".to_string());
-        return;
+        return false;
     }
-    lines.extend(entries.into_iter().take(limit));
-    if total > limit {
-        lines.push(format!("… {} more; raise ref_limit", total - limit));
+    let shown_count = total.saturating_sub(offset).min(limit);
+    let next_offset = offset.saturating_add(shown_count);
+    lines.extend(entries);
+    if next_offset < total {
+        lines.push(format!(
+            "… {} more (pass offset={next_offset})",
+            total - next_offset
+        ));
     }
+    offset > 0 || next_offset < total
 }
 
 fn append_compact_enumeration(
@@ -701,11 +772,47 @@ fn append_compact_enumeration(
     lines.push(format!("{heading}: {}{marker}", entries.join("; ")));
 }
 
+fn reference_relevance(definition_file: &str, reference_file: &str) -> u8 {
+    if reference_file == definition_file {
+        return 0;
+    }
+    let definition_scope = definition_file.split('/').next();
+    let reference_scope = reference_file.split('/').next();
+    if definition_scope == reference_scope {
+        1
+    } else {
+        2
+    }
+}
+
+fn grouped_reference_lines(reference_sites: &[(String, usize)]) -> Vec<String> {
+    let mut grouped: Vec<(String, Vec<usize>)> = Vec::new();
+    for (file, line) in reference_sites {
+        if let Some((_, lines)) = grouped.last_mut().filter(|(entry, _)| entry == file) {
+            lines.push(line + 1);
+        } else {
+            grouped.push((file.clone(), vec![line + 1]));
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(file, lines)| {
+            let lines = lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{file}: {lines}")
+        })
+        .collect()
+}
+
 pub(crate) fn map_symbols(
     project_root: &Path,
     index: &SemanticIndex,
     names: &[String],
     ref_limit: usize,
+    offset: usize,
 ) -> Result<String> {
     if !(1..=MAX_MAP_NAMES).contains(&names.len()) {
         bail!("names must contain between 1 and {MAX_MAP_NAMES} entries");
@@ -759,19 +866,32 @@ pub(crate) fn map_symbols(
             ));
             continue;
         }
+        let mut other_candidate_count = None;
         if matches.len() > 1 {
-            lines.push(format!("## ambiguous: {name}"));
-            lines.extend(
-                symbol_candidates(index, name, false)?
-                    .into_iter()
-                    .map(|candidate| candidate.render()),
-            );
-            continue;
+            let candidates = symbol_candidates(index, name, false)?;
+            let dominant_symbol = dominant_candidate(name, &candidates).map(str::to_owned);
+            let Some(position) = dominant_symbol
+                .as_deref()
+                .and_then(|symbol| matches.iter().position(|entry| entry.2 == symbol))
+            else {
+                if let Some(ambiguity) =
+                    ambiguity_candidate_lines(format!("## ambiguous: {name}"), candidates)
+                {
+                    lines.extend(ambiguity);
+                }
+                continue;
+            };
+            other_candidate_count = Some(candidates.len().saturating_sub(1));
+            matches.swap(0, position);
+            matches.truncate(1);
         }
 
         let (file, line, symbol, information) = matches.remove(0);
         if !exact_qualified {
             resolutions.push(format!("resolved {name} → {}", qualified_name(information)));
+        }
+        if let Some(count) = other_candidate_count {
+            resolutions.push(format!("other candidates: {count} (scip_find to list)"));
         }
         lines.push(format!("## {}", qualified_name(information)));
         lines.push(format!(
@@ -791,47 +911,101 @@ pub(crate) fn map_symbols(
 
         let family = matching_symbol_ids(index, &display_name(information));
         let reference_symbols = family.reference_symbols(&symbol);
-        let reference_sites = reference_symbols
+        let mut reference_sites = reference_symbols
             .iter()
             .filter_map(|reference_symbol| index.references_for(reference_symbol))
             .flat_map(|sites| sites.iter().cloned())
             .collect::<BTreeSet<_>>();
-        let mut references = Vec::new();
-        let mut reference_files = Vec::new();
-        for (reference_file, reference_line) in reference_sites {
-            if sources.is_import_or_export(&reference_file, reference_line) {
-                continue;
-            }
-            reference_files.push(reference_file.clone());
-            let prefix = format!("{reference_file}:{}", reference_line + 1);
-            references.push(
-                match sources.display_line(&reference_file, reference_line) {
-                    Some(source) => format!("{prefix}: {source}"),
-                    None => prefix,
-                },
-            );
-        }
-        let references_truncated = references.len() > ref_limit;
-        let reference_files = reference_files.into_iter().take(ref_limit).collect();
-        append_limited_section(&mut lines, "references", references, ref_limit);
+        reference_sites.retain(|(reference_file, reference_line)| {
+            !sources.is_import_or_export(reference_file, *reference_line)
+        });
+        let mut reference_sites = reference_sites.into_iter().collect::<Vec<_>>();
+        reference_sites.sort_by(|left, right| {
+            reference_relevance(&file, &left.0)
+                .cmp(&reference_relevance(&file, &right.0))
+                .then_with(|| left.cmp(right))
+        });
+        let total_references = reference_sites.len();
+        let shown_reference_sites = reference_sites
+            .into_iter()
+            .skip(offset)
+            .take(ref_limit)
+            .collect::<Vec<_>>();
+        let reference_files = shown_reference_sites
+            .iter()
+            .map(|(reference_file, _)| reference_file.clone())
+            .collect();
+        let references = if total_references > GROUPED_REFERENCE_THRESHOLD {
+            grouped_reference_lines(&shown_reference_sites)
+        } else {
+            shown_reference_sites
+                .iter()
+                .map(|(reference_file, reference_line)| {
+                    let prefix = format!("{reference_file}:{}", reference_line + 1);
+                    match sources.display_line(reference_file, *reference_line) {
+                        Some(source) => format!("{prefix}: {source}"),
+                        None => prefix,
+                    }
+                })
+                .collect()
+        };
+        let references_truncated = append_limited_section(
+            &mut lines,
+            "references",
+            references,
+            total_references,
+            ref_limit,
+            offset,
+        );
 
         let callers = index.direct_caller_entries(project_root, &reference_symbols);
-        let callers_truncated = callers.len() > ref_limit;
+        let total_callers = callers.len();
         let caller_names = callers
             .iter()
+            .skip(offset)
             .take(ref_limit)
             .map(|(_, name)| name.clone())
             .collect();
-        let caller_lines = callers.into_iter().map(|(line, _)| line).collect();
-        append_limited_section(&mut lines, "callers", caller_lines, ref_limit);
-        append_compact_enumeration(&mut lines, "callers", caller_names, callers_truncated);
-        append_compact_enumeration(&mut lines, "files", reference_files, references_truncated);
+        let caller_lines = callers
+            .into_iter()
+            .skip(offset)
+            .take(ref_limit)
+            .map(|(line, _)| line)
+            .collect();
+        let callers_truncated = append_limited_section(
+            &mut lines,
+            "callers",
+            caller_lines,
+            total_callers,
+            ref_limit,
+            offset,
+        );
+        if !callers_truncated {
+            append_compact_enumeration(&mut lines, "callers", caller_names, false);
+        }
+        if !references_truncated {
+            append_compact_enumeration(&mut lines, "files", reference_files, false);
+        }
+    }
+    let available_lines = MAX_MAP_RESULT_LINES.saturating_sub(resolutions.len());
+    if lines.len() > available_lines {
+        let shown = available_lines.saturating_sub(1);
+        let omitted = lines.len().saturating_sub(shown);
+        lines.truncate(shown);
+        if available_lines > 0 {
+            lines.push(format!("… +{omitted} more lines"));
+        }
     }
     resolutions.extend(lines);
     Ok(resolutions.join("\n"))
 }
 
-pub(crate) fn references(index: &SemanticIndex, name: &str, limit: usize) -> Result<String> {
+pub(crate) fn references(
+    index: &SemanticIndex,
+    name: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<String> {
     if name.trim().is_empty() {
         bail!("name must not be empty");
     }
@@ -855,7 +1029,12 @@ pub(crate) fn references(index: &SemanticIndex, name: &str, limit: usize) -> Res
     }
 
     let total = locations.len();
-    let shown_locations = locations.into_iter().take(limit).collect::<Vec<_>>();
+    let shown_locations = locations
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let shown_count = shown_locations.len();
     let files = shown_locations
         .iter()
         .map(|(file, _)| file.clone())
@@ -876,18 +1055,24 @@ pub(crate) fn references(index: &SemanticIndex, name: &str, limit: usize) -> Res
         })
         .collect::<Vec<_>>();
 
-    let omitted = total.saturating_sub(limit);
+    let next_offset = offset.saturating_add(shown_count);
+    let omitted = total.saturating_sub(next_offset);
     let mut lines = rendered;
     if omitted > 0 {
-        lines.push(format!(
-            "{omitted} more reference sites; raise limit to see them."
-        ));
+        lines.push(format!("… {omitted} more (pass offset={next_offset})"));
     }
-    append_compact_enumeration(&mut lines, "files", files, omitted > 0);
+    if offset == 0 && omitted == 0 {
+        append_compact_enumeration(&mut lines, "files", files, false);
+    }
     Ok(lines.join("\n"))
 }
 
-pub(crate) fn outline(index: &SemanticIndex, file: &str) -> Result<String> {
+pub(crate) fn outline(
+    index: &SemanticIndex,
+    file: &str,
+    limit: usize,
+    offset: usize,
+) -> Result<String> {
     if file.trim().is_empty() {
         bail!("file must not be empty");
     }
@@ -926,7 +1111,8 @@ pub(crate) fn outline(index: &SemanticIndex, file: &str) -> Result<String> {
             .into_iter()
             .map(|(line, kind, name)| format!("{} {kind} {name}", line + 1))
             .collect(),
-        MAX_RESULT_LINES - 1,
+        limit,
+        offset,
     ))
 }
 
@@ -948,22 +1134,34 @@ mod tests {
 
     #[test]
     fn find_returns_disambiguated_candidates_with_signatures() {
-        let output = find(&SemanticIndex::new(fixture(false)), "rngState", 10, false)
-            .expect("find candidates");
+        let output = find(
+            &SemanticIndex::new(fixture(false)),
+            "rngState",
+            10,
+            0,
+            false,
+        )
+        .expect("find candidates");
         assert_eq!(
             output,
-            "persistence.ts/SaveData#rngState. | property | src/persistence.ts:34 | rngState: number\nrng.ts/rngState(). | function | src/lib/rng.ts:3 | function rngState(): number"
+            "rng.ts/rngState(). | function | src/lib/rng.ts:3 | function rngState(): number\npersistence.ts/SaveData#rngState. | property | src/persistence.ts:34 | rngState: number"
         );
 
-        let limited = find(&SemanticIndex::new(fixture(false)), "formatDate", 1, false)
-            .expect("limited candidates");
+        let limited = find(
+            &SemanticIndex::new(fixture(false)),
+            "formatDate",
+            1,
+            0,
+            false,
+        )
+        .expect("limited candidates");
         assert_eq!(limited.lines().count(), 2);
-        assert!(limited.ends_with("… 1 more; raise limit"));
+        assert!(limited.ends_with("… 1 more (pass offset=1)"));
     }
 
     #[test]
     fn find_unreferenced_excludes_symbols_with_inbound_references() {
-        let output = find(&SemanticIndex::new(fixture(false)), "*", 100, true)
+        let output = find(&SemanticIndex::new(fixture(false)), "*", 100, 0, true)
             .expect("unreferenced candidates");
         assert!(output.contains("dead.ts/neverUsed(). | function | src/lib/dead.ts:11"));
         assert!(!output.contains("localOnly"));
@@ -971,28 +1169,87 @@ mod tests {
     }
 
     #[test]
-    fn map_symbols_disambiguates_and_caps_references_and_callers() {
+    fn ambiguity_responses_cap_ranked_candidates_at_ten() {
+        let project = TestProject::new();
+        let mut fixture = fixture(false);
+        for index in 0..12 {
+            let symbol =
+                format!("scip-typescript npm fixture 1.0.0 duplicate{index}.ts/duplicate().");
+            fixture.documents.push(Document {
+                language: "typescript".to_string(),
+                relative_path: format!("src/duplicates/duplicate{index}.ts"),
+                occurrences: vec![legacy_occurrence(&symbol, 0, true)],
+                symbols: vec![symbol_information(
+                    &symbol,
+                    "duplicate",
+                    symbol_information::Kind::Function,
+                    "function duplicate(): void",
+                    "Duplicate candidate.",
+                )],
+                ..Default::default()
+            });
+        }
+        let index = SemanticIndex::new(fixture);
+
+        let mapped = map_symbols(
+            &project.root,
+            &index,
+            &["duplicate".to_string()],
+            DEFAULT_MAP_REFS_LIMIT,
+            0,
+        )
+        .expect("ambiguous map");
+        assert!(mapped.starts_with("## ambiguous: duplicate\n"));
+        assert_eq!(
+            mapped
+                .lines()
+                .filter(|line| line.starts_with("- duplicate"))
+                .count(),
+            AMBIGUITY_LIMIT
+        );
+        assert!(mapped.ends_with(
+            "… 2 more candidates; pass a qualified name (scip_find name offset=10 limit=10 to page)"
+        ));
+
+        let definition =
+            definitions(&project.root, &index, "duplicate").expect("ambiguous definition response");
+        assert_eq!(
+            definition
+                .lines()
+                .filter(|line| line.starts_with("- duplicate"))
+                .count(),
+            AMBIGUITY_LIMIT
+        );
+        assert!(definition.ends_with(
+            "… 2 more candidates; pass a qualified name (scip_find name offset=10 limit=10 to page)"
+        ));
+    }
+
+    #[test]
+    fn map_symbols_auto_resolves_and_caps_references_and_callers() {
         let project = TestProject::new();
         write_fixture(&project, false);
         let index = SemanticIndex::new(fixture(false));
 
-        let ambiguous = map_symbols(
+        let resolved = map_symbols(
             &project.root,
             &index,
             &["rngState".to_string()],
             DEFAULT_MAP_REFS_LIMIT,
+            0,
         )
-        .expect("ambiguous map");
-        assert!(ambiguous.starts_with("## ambiguous: rngState\n"));
-        assert!(ambiguous.contains(
-            "persistence.ts/SaveData#rngState. | property | src/persistence.ts:34 | rngState: number"
-        ));
+        .expect("auto-resolved map");
+        assert!(resolved.starts_with("resolved rngState → rng.ts/rngState().\n"));
+        assert!(resolved.contains("other candidates: 1 (scip_find to list)"));
+        assert!(resolved.contains("## rng.ts/rngState()."));
+        assert!(!resolved.contains("## ambiguous:"));
 
         let mapped = map_symbols(
             &project.root,
             &index,
             &["date.ts/formatDate().".to_string()],
             1,
+            0,
         )
         .expect("qualified map");
         assert!(mapped.contains("definition: function src/lib/date.ts:42"));
@@ -1000,22 +1257,157 @@ mod tests {
         assert_eq!(
             mapped
                 .lines()
-                .filter(|line| *line == "… 1 more; raise ref_limit")
+                .filter(|line| *line == "… 1 more (pass offset=1)")
                 .count(),
             2
         );
-        assert!(mapped.contains("callers: <module> src/app.ts (truncated)"));
-        assert!(mapped.contains("files: src/app.ts (truncated)"));
+        assert!(!mapped.lines().any(|line| line.starts_with("callers: ")));
+        assert!(!mapped.lines().any(|line| line.starts_with("files: ")));
 
         let mapped = map_symbols(
             &project.root,
             &index,
             &["date.ts/formatDate().".to_string()],
             DEFAULT_MAP_REFS_LIMIT,
+            0,
         )
         .expect("uncapped qualified map");
         assert!(mapped.contains("callers: <module> src/app.ts; formatDateLong"));
         assert!(mapped.contains("files: src/app.ts; src/lib/date.ts"));
+    }
+
+    #[test]
+    fn map_symbols_groups_large_reference_sets_without_snippets() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let mut fixture = fixture(false);
+        let occurrences = (0..31)
+            .map(|line| legacy_occurrence(DATE_SYMBOL, line, false))
+            .collect();
+        fixture.documents.push(Document {
+            language: "typescript".to_string(),
+            relative_path: "src/grouped.ts".to_string(),
+            occurrences,
+            ..Default::default()
+        });
+        let sources = (0..31)
+            .map(|line| format!("const grouped{line} = formatDate(today);"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(project.root.join("src/grouped.ts"), sources)
+            .expect("write grouped-reference source");
+
+        let output = map_symbols(
+            &project.root,
+            &SemanticIndex::new(fixture),
+            &["date.ts/formatDate().".to_string()],
+            100,
+            0,
+        )
+        .expect("grouped map");
+        let reference_lines = output
+            .lines()
+            .skip_while(|line| *line != "references:")
+            .skip(1)
+            .take_while(|line| *line != "callers:")
+            .collect::<Vec<_>>();
+        assert_eq!(reference_lines.first(), Some(&"src/lib/date.ts: 15"));
+        assert!(reference_lines
+            .iter()
+            .any(|line| line.starts_with("src/grouped.ts: 1, 2, 3")));
+        assert!(!reference_lines
+            .iter()
+            .any(|line| line.contains("const grouped")));
+    }
+
+    #[test]
+    fn offsets_return_disjoint_find_map_reference_and_outline_pages() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let index = SemanticIndex::new(fixture(true));
+
+        let first_find = find(&index, "formatDate", 1, 0, false).expect("first find page");
+        let second_find = find(&index, "formatDate", 1, 1, false).expect("second find page");
+        assert!(first_find.starts_with("date.ts/formatDate()."));
+        assert!(second_find.starts_with("date.ts/formatDateLong()."));
+        assert!(!second_find
+            .lines()
+            .any(|line| line == first_find.lines().next().unwrap()));
+
+        let first_map = map_symbols(
+            &project.root,
+            &index,
+            &["date.ts/formatDate().".to_string()],
+            1,
+            0,
+        )
+        .expect("first map page");
+        let second_map = map_symbols(
+            &project.root,
+            &index,
+            &["date.ts/formatDate().".to_string()],
+            1,
+            1,
+        )
+        .expect("second map page");
+        assert!(first_map.contains("src/lib/date.ts:15:"));
+        assert!(second_map.contains("src/app.ts:40:"));
+        assert!(!second_map.contains("src/lib/date.ts:15:"));
+        assert!(!first_map.lines().any(|line| line.starts_with("files: ")));
+        assert!(!second_map.lines().any(|line| line.starts_with("files: ")));
+
+        let first_refs = references(&index, "formatDate", 2, 0).expect("first refs page");
+        let second_refs = references(&index, "formatDate", 2, 2).expect("second refs page");
+        assert!(first_refs.starts_with("src/app.ts: 8, 12"));
+        assert!(!second_refs.contains("src/app.ts: 8, 12"));
+        assert!(!first_refs.lines().any(|line| line.starts_with("files: ")));
+        assert!(!second_refs.lines().any(|line| line.starts_with("files: ")));
+
+        let first_outline = outline(&index, "src/lib/date.ts", 1, 0).expect("first outline page");
+        let second_outline = outline(&index, "src/lib/date.ts", 1, 1).expect("second outline page");
+        assert!(first_outline.starts_with("10 function formatDateLong"));
+        assert!(second_outline.starts_with("42 function formatDate"));
+        assert!(!second_outline.contains("10 function formatDateLong"));
+    }
+
+    #[test]
+    fn map_symbols_caps_the_total_output_lines() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        fs::create_dir_all(project.root.join("src/cap")).expect("create cap source directory");
+        let mut fixture = fixture(false);
+        let mut names = Vec::new();
+        for index in 0..MAX_MAP_NAMES {
+            let name = format!("capTarget{index}");
+            let symbol = format!("scip-typescript npm fixture 1.0.0 cap{index}.ts/{name}().");
+            let file = format!("src/cap/cap{index}.ts");
+            let mut occurrences = vec![legacy_occurrence(&symbol, 0, true)];
+            occurrences.extend((1..=30).map(|line| legacy_occurrence(&symbol, line, false)));
+            fixture.documents.push(Document {
+                language: "typescript".to_string(),
+                relative_path: file.clone(),
+                occurrences,
+                symbols: vec![symbol_information(
+                    &symbol,
+                    &name,
+                    symbol_information::Kind::Function,
+                    &format!("function {name}(): void"),
+                    "Map cap target.",
+                )],
+                ..Default::default()
+            });
+            let sources = std::iter::once(format!("function {name}(): void {{}}"))
+                .chain((1..=30).map(|line| format!("const use{line} = {name}();")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            fs::write(project.root.join(file), sources).expect("write cap source");
+            names.push(name);
+        }
+
+        let output = map_symbols(&project.root, &SemanticIndex::new(fixture), &names, 30, 0)
+            .expect("capped map");
+        assert_eq!(output.lines().count(), MAX_MAP_RESULT_LINES);
+        assert!(output.lines().last().unwrap().starts_with("… +"));
     }
 
     #[test]
@@ -1027,6 +1419,7 @@ mod tests {
             &SemanticIndex::new(fixture(false)),
             &["neverUsed".to_string()],
             DEFAULT_MAP_REFS_LIMIT,
+            0,
         )
         .expect("empty map");
         assert!(!output.lines().any(|line| line.starts_with("callers: ")));
@@ -1062,7 +1455,7 @@ mod tests {
             "function rngState src/lib/rng.ts:3\nproperty rngState (SaveData) src/persistence.ts:34"
         );
 
-        let expected = "ambiguous: rngState\n- persistence.ts/SaveData#rngState. | property | src/persistence.ts\n- rng.ts/rngState(). | function | src/lib/rng.ts\nspecify the qualified name";
+        let expected = "ambiguous: rngState\nsrc/lib/rng.ts:\n- rng.ts/rngState(). | function | line 3 | function rngState(): number\nsrc/persistence.ts:\n- persistence.ts/SaveData#rngState. | property | line 34 | rngState: number";
         let definition_output = definitions(&project.root, &index, "rngState").expect("definition");
         let map_output = map_bundle(
             &project.root,
@@ -1073,7 +1466,8 @@ mod tests {
             false,
         )
         .expect("map rngState");
-        let refs_output = references(&index, "rngState", DEFAULT_REFS_LIMIT).expect("references");
+        let refs_output =
+            references(&index, "rngState", DEFAULT_REFS_LIMIT, 0).expect("references");
         let callers_output =
             callers(&project.root, &index, "rngState", 1, DEFAULT_CALLERS_LIMIT).expect("callers");
 
@@ -1153,7 +1547,7 @@ mod tests {
         assert!(map.contains("src/app.ts:35: return formatDate(today);"));
         assert!(map.contains("src/app.ts:40: const label = formatDate(today);"));
 
-        let refs = references(&index, "formatDate", DEFAULT_REFS_LIMIT).expect("alias refs");
+        let refs = references(&index, "formatDate", DEFAULT_REFS_LIMIT, 0).expect("alias refs");
         assert!(refs.contains("src/app.ts: 8, 12, 35, 40"));
 
         let callers = callers(
@@ -1189,7 +1583,7 @@ mod tests {
     }
 
     #[test]
-    fn map_and_refs_cap_reference_sites_with_raise_hints() {
+    fn map_and_refs_cap_reference_sites_with_offset_hints() {
         let project = TestProject::new();
         write_fixture(&project, false);
         let mut index = fixture(false);
@@ -1222,12 +1616,10 @@ mod tests {
         assert!(output.contains(
             "src/many.ts: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18"
         ));
-        assert!(output.ends_with("7 more reference sites; raise refs_limit to see them."));
+        assert!(output.ends_with("… 7 more (pass offset=20)"));
 
-        let refs = references(&index, "formatDate", DEFAULT_REFS_LIMIT).expect("large refs");
-        assert!(refs.ends_with(
-            "9 more reference sites; raise limit to see them.\nfiles: src/app.ts; src/lib/date.ts; src/many.ts (truncated)"
-        ));
+        let refs = references(&index, "formatDate", DEFAULT_REFS_LIMIT, 0).expect("large refs");
+        assert!(refs.ends_with("… 9 more (pass offset=20)"));
         assert!(!refs.contains("src/many.ts: 17"));
     }
 
@@ -1250,16 +1642,14 @@ mod tests {
     #[test]
     fn references_are_grouped_by_file_and_limited() {
         let output =
-            references(&SemanticIndex::new(fixture(true)), "formatDate", 2).expect("references");
-        assert_eq!(
-            output,
-            "src/app.ts: 8, 12\n3 more reference sites; raise limit to see them.\nfiles: src/app.ts (truncated)"
-        );
+            references(&SemanticIndex::new(fixture(true)), "formatDate", 2, 0).expect("references");
+        assert_eq!(output, "src/app.ts: 8, 12\n… 3 more (pass offset=2)");
 
         let output = references(
             &SemanticIndex::new(fixture(false)),
             "formatDate",
             DEFAULT_REFS_LIMIT,
+            0,
         )
         .expect("uncapped references");
         assert!(output.ends_with("files: src/app.ts; src/lib/date.ts"));
@@ -1268,6 +1658,7 @@ mod tests {
             &SemanticIndex::new(fixture(false)),
             "neverUsed",
             DEFAULT_REFS_LIMIT,
+            0,
         )
         .expect("empty references");
         assert_eq!(output, "no references");
@@ -1421,8 +1812,13 @@ mod tests {
 
     #[test]
     fn outline_is_a_sorted_file_skeleton() {
-        let output =
-            outline(&SemanticIndex::new(fixture(false)), "./src/lib/date.ts").expect("outline");
+        let output = outline(
+            &SemanticIndex::new(fixture(false)),
+            "./src/lib/date.ts",
+            38,
+            0,
+        )
+        .expect("outline");
         assert_eq!(output, "10 function formatDateLong\n42 function formatDate");
     }
 }

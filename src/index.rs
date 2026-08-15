@@ -113,6 +113,14 @@ pub(crate) struct IndexCache {
 
 impl IndexCache {
     pub(crate) fn load(&mut self, project_root: &Path) -> Result<LoadedIndex> {
+        let loaded = self.load_for_check(project_root)?;
+        if let Some(message) = IndexStats::from_loaded(&loaded).empty_index_message() {
+            bail!("{message}");
+        }
+        Ok(loaded)
+    }
+
+    pub(crate) fn load_for_check(&mut self, project_root: &Path) -> Result<LoadedIndex> {
         validate_project_root(project_root)?;
         let path = index_path(project_root);
         let metadata = match fs::metadata(&path) {
@@ -199,6 +207,22 @@ impl IndexStats {
             "documents {} | symbols {} | occurrences {} | size {} B",
             self.documents, self.symbols, self.occurrences, self.file_size
         )
+    }
+
+    pub(crate) fn empty_index_message(self) -> Option<String> {
+        if self.documents == 0 {
+            Some(
+                "index is empty (0 documents) — likely a crashed indexer; run scip_index to rebuild"
+                    .to_string(),
+            )
+        } else if self.symbols == 0 {
+            Some(
+                "index is empty (0 symbols) — likely a crashed indexer; run scip_index to rebuild"
+                    .to_string(),
+            )
+        } else {
+            None
+        }
     }
 }
 

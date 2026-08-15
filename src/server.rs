@@ -27,6 +27,7 @@ pub(crate) const DEFAULT_REFS_LIMIT: usize = 20;
 pub(crate) const DEFAULT_MAP_REFS_LIMIT: usize = 20;
 pub(crate) const DEFAULT_CALLERS_LIMIT: usize = 40;
 pub(crate) const DEFAULT_DEAD_LIMIT: usize = 100;
+const DEFAULT_OUTLINE_LIMIT: usize = 38;
 pub(crate) const MAX_LIMIT: usize = 200;
 const MAX_CALLER_DEPTH: usize = 3;
 const HELP_TEXT: &str = "Usage:\n  crux [--profile slim|full]\n  crux [--profile slim|full] --version\n  crux self-update [--check]\n  crux check <absolute-project-root>\n  crux setup <codex|claude> [--project <dir>]\n  crux unsetup <codex|claude> [--project <dir>]";
@@ -73,6 +74,8 @@ struct FindArgs {
     #[serde(default = "default_find_limit")]
     limit: usize,
     #[serde(default)]
+    offset: usize,
+    #[serde(default)]
     unreferenced: bool,
 }
 
@@ -99,6 +102,8 @@ struct MapArgs {
     names: Vec<String>,
     #[serde(default = "default_map_ref_limit")]
     ref_limit: usize,
+    #[serde(default)]
+    offset: usize,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +113,8 @@ struct RefsArgs {
     name: String,
     #[serde(default = "default_refs_limit")]
     limit: usize,
+    #[serde(default)]
+    offset: usize,
 }
 
 #[derive(Deserialize)]
@@ -138,6 +145,10 @@ struct DeadArgs {
 struct OutlineArgs {
     project_root: String,
     file: String,
+    #[serde(default = "default_outline_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
 }
 
 fn default_find_limit() -> usize {
@@ -166,6 +177,10 @@ fn default_callers_limit() -> usize {
 
 fn default_dead_limit() -> usize {
     DEFAULT_DEAD_LIMIT
+}
+
+fn default_outline_limit() -> usize {
+    DEFAULT_OUTLINE_LIMIT
 }
 
 fn default_true() -> bool {
@@ -274,6 +289,7 @@ impl Server {
                     &loaded.index,
                     &arguments.name,
                     bounded_limit(arguments.limit),
+                    arguments.offset,
                     arguments.unreferenced,
                 )
             }),
@@ -301,6 +317,7 @@ impl Server {
                     &loaded.index,
                     &arguments.names,
                     bounded_limit(arguments.ref_limit),
+                    arguments.offset,
                 )
             }),
             "scip_refs" if self.expanded => {
@@ -310,6 +327,7 @@ impl Server {
                         &loaded.index,
                         &arguments.name,
                         bounded_limit(arguments.limit),
+                        arguments.offset,
                     )
                 })
             }
@@ -341,7 +359,12 @@ impl Server {
             "scip_outline" => {
                 parse_arguments::<OutlineArgs>(name, arguments).and_then(|arguments| {
                     let loaded = self.cache.load(Path::new(&arguments.project_root))?;
-                    outline(&loaded.index, &arguments.file)
+                    outline(
+                        &loaded.index,
+                        &arguments.file,
+                        bounded_limit(arguments.limit),
+                        arguments.offset,
+                    )
                 })
             }
             "scip_expand" => Ok(self.expand()),
@@ -486,6 +509,10 @@ fn slim_tool_definitions() -> Vec<Value> {
                         "type": "integer",
                         "description": "Candidate limit."
                     },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0
+                    },
                     "unreferenced": {
                         "type": "boolean",
                         "description": "Require no inbound references."
@@ -514,6 +541,10 @@ fn slim_tool_definitions() -> Vec<Value> {
                         "type": "integer",
                         "default": DEFAULT_MAP_REF_LIMIT,
                         "description": "Per-symbol reference and caller limit."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0
                     }
                 }),
                 required_fields("scip_map")
@@ -531,6 +562,16 @@ fn slim_tool_definitions() -> Vec<Value> {
                     "file": {
                         "type": "string",
                         "description": "Project-relative file."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": DEFAULT_OUTLINE_LIMIT,
+                        "minimum": 1,
+                        "maximum": MAX_LIMIT
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0
                     }
                 }),
                 required_fields("scip_outline")
@@ -598,6 +639,10 @@ fn narrow_tool_definitions() -> Vec<Value> {
                         "default": DEFAULT_NARROW_REFS_LIMIT,
                         "minimum": 1,
                         "maximum": MAX_LIMIT
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0
                     }
                 }),
                 required_fields("scip_refs")
@@ -699,6 +744,18 @@ fn run_stdio(profile: Profile) -> Result<()> {
     serve_stdio(stdin.lock(), stdout, profile)
 }
 
+fn check_index(project_root: &Path) -> Result<String> {
+    let mut cache = IndexCache::default();
+    let loaded = cache.load_for_check(project_root)?;
+    let stats = IndexStats::from_loaded(&loaded);
+    let mut output = stats.compact();
+    if let Some(message) = stats.empty_index_message() {
+        output.push_str("\nwarning: ");
+        output.push_str(&message);
+    }
+    Ok(output)
+}
+
 fn resolve_profile(
     arguments: Vec<String>,
     environment_profile: Option<&str>,
@@ -747,9 +804,7 @@ pub fn run() -> Result<()> {
             update::run_self_update(true)
         }
         [command, project_root] if command == "check" => {
-            let mut cache = IndexCache::default();
-            let loaded = cache.load(Path::new(project_root))?;
-            println!("{}", IndexStats::from_loaded(&loaded).compact());
+            println!("{}", check_index(Path::new(project_root))?);
             Ok(())
         }
         [command, arguments @ ..] if command == "setup" || command == "unsetup" => {
@@ -770,6 +825,86 @@ pub fn run() -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::*;
+    use protobuf::Message;
+    use scip::types::{Document, Index};
+    use std::fs;
+
+    fn write_test_index(project: &TestProject, index: &Index) {
+        let bytes = index.write_to_bytes().expect("serialize test index");
+        fs::write(project.root.join(".scip-nav/index.scip"), bytes).expect("write test index");
+    }
+
+    #[test]
+    fn empty_index_rejects_every_query_tool_and_warns_during_check() {
+        let project = TestProject::new();
+        write_test_index(&project, &Index::default());
+        let expected =
+            "index is empty (0 documents) — likely a crashed indexer; run scip_index to rebuild";
+        let cases = vec![
+            (
+                "scip_map",
+                json!({"project_root": &project.root, "names": ["missing"]}),
+            ),
+            (
+                "scip_find",
+                json!({"project_root": &project.root, "name": "missing"}),
+            ),
+            (
+                "scip_refs",
+                json!({"project_root": &project.root, "name": "missing"}),
+            ),
+            (
+                "scip_callers",
+                json!({"project_root": &project.root, "name": "missing"}),
+            ),
+            (
+                "scip_search",
+                json!({"project_root": &project.root, "query": "missing"}),
+            ),
+            (
+                "scip_outline",
+                json!({"project_root": &project.root, "file": "missing.rs"}),
+            ),
+            ("scip_dead", json!({"project_root": &project.root})),
+        ];
+        let mut server = Server::new(Profile::Full);
+
+        for (tool, arguments) in cases {
+            let result = server.call_tool(tool, &arguments);
+            assert!(result.is_error, "{tool}");
+            assert_eq!(result.text, expected, "{tool}");
+        }
+
+        let check = check_index(&project.root).expect("check empty index");
+        assert!(check.contains("documents 0 | symbols 0"));
+        assert!(check.ends_with(&format!("warning: {expected}")));
+    }
+
+    #[test]
+    fn symbol_less_index_is_rejected() {
+        let project = TestProject::new();
+        write_test_index(
+            &project,
+            &Index {
+                documents: vec![Document {
+                    relative_path: "src/empty.rs".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let mut server = Server::new(Profile::Full);
+        let result = server.call_tool(
+            "scip_find",
+            &json!({"project_root": &project.root, "name": "missing"}),
+        );
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.text,
+            "index is empty (0 symbols) — likely a crashed indexer; run scip_index to rebuild"
+        );
+    }
 
     #[test]
     fn tool_schemas_match_dispatch_required_fields() {
@@ -810,7 +945,7 @@ mod tests {
         );
         assert_eq!(
             response.pointer("/result/content/0/text"),
-            Some(&json!("scip_find: invalid arguments (unknown field `query`, expected one of `project_root`, `name`, `limit`, `unreferenced`). Required: project_root, name."))
+            Some(&json!("scip_find: invalid arguments (unknown field `query`, expected one of `project_root`, `name`, `limit`, `offset`, `unreferenced`). Required: project_root, name."))
         );
     }
 
@@ -882,12 +1017,12 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(
             result.text,
-            "resolved formatDate → date.ts/formatDate().\n## date.ts/formatDate().\ndefinition: function src/lib/date.ts:42\nsignature: function formatDate(input: Date): string\nreferences:\nsrc/app.ts:40: const label = formatDate(today);\nsrc/lib/date.ts:15: return formatDate(input);\ncallers:\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)\ncallers: <module> src/app.ts; formatDateLong\nfiles: src/app.ts; src/lib/date.ts"
+            "resolved formatDate → date.ts/formatDate().\n## date.ts/formatDate().\ndefinition: function src/lib/date.ts:42\nsignature: function formatDate(input: Date): string\nreferences:\nsrc/lib/date.ts:15: return formatDate(input);\nsrc/app.ts:40: const label = formatDate(today);\ncallers:\n<module> src/app.ts (x1)\nfunction formatDateLong src/lib/date.ts:10 (x1)\ncallers: <module> src/app.ts; formatDateLong\nfiles: src/app.ts; src/lib/date.ts"
         );
     }
 
     #[test]
-    fn scip_map_lists_candidates_for_a_bare_name_with_multiple_matches() {
+    fn scip_map_auto_resolves_a_dominant_bare_name() {
         let project = TestProject::new();
         write_fixture(&project, false);
         let mut server = Server::default();
@@ -900,10 +1035,14 @@ mod tests {
         );
 
         assert!(!result.is_error);
-        assert_eq!(
-            result.text,
-            "## ambiguous: rngState\npersistence.ts/SaveData#rngState. | property | src/persistence.ts:34 | rngState: number\nrng.ts/rngState(). | function | src/lib/rng.ts:3 | function rngState(): number"
-        );
+        assert!(result
+            .text
+            .starts_with("resolved rngState → rng.ts/rngState().\n"));
+        assert!(result
+            .text
+            .contains("other candidates: 1 (scip_find to list)"));
+        assert!(result.text.contains("## rng.ts/rngState()."));
+        assert!(!result.text.contains("## ambiguous:"));
     }
 
     #[test]
