@@ -1,5 +1,15 @@
 # crux
 
+**In benchmarked coding sessions, crux makes an agent right 9 times out of 10 — and cuts the cost of each correct answer almost in half.**
+
+| Session benchmark (48 questions, Codex CLI) | grep only | with crux |
+| --- | --- | --- |
+| Correct answers | 28/48 (58%) | **43/48 (90%)** |
+| Tokens per correct answer | 59,394 | **31,644 (−47%)** |
+| On SymPy (770k lines) | 82,822 | **34,248 (−59%)** |
+
+The larger the codebase, the larger the gain. Full data: [results post](https://halv.ai/blog/crux-sessions) and [methodology deep-dive](https://halv.ai/blog/crux-sessions-deep-dive).
+
 ## What crux is
 
 crux is an MCP server for AI coding agents. It reads a [SCIP](https://github.com/sourcegraph/scip) index of your code. It answers these questions in compact text:
@@ -11,7 +21,7 @@ crux is an MCP server for AI coding agents. It reads a [SCIP](https://github.com
 
 The agent does not read full files to find these answers. Thus the agent uses fewer tokens.
 
-In paired Codex CLI runs, crux raised correct answers from 66% to 96%. Tokens per correct answer fell by 24%. The [Benchmark](#benchmark) section has details.
+In session-shaped Codex CLI benchmarks, crux raised correct answers from 58% to 90%. Tokens per correct answer fell by 47%. On the hardest repository, they fell by 59%. The [Benchmark](#benchmark) section has details.
 
 ## Installation
 
@@ -174,9 +184,24 @@ crux writes the index to `<project>/.scip-nav/index.scip`. Add `.scip-nav/` to y
 
 ## Benchmark
 
-Version 0.6 was tested on 50 verifiable navigation questions. The repositories were Django (2,572 files / 344k lines) and SymPy (1,555 files / 770k lines).
+The repositories were Django (2,572 files / 344k lines) and SymPy (1,555 files / 770k lines). All runs used paired, token-metered Codex CLI sessions with identical questions and scoring.
 
-Each question used paired, token-metered Codex CLI runs.
+### Sessions (crux 0.6.2)
+
+Six navigation questions per continuous session, four sessions per repository. This is the realistic setup: the index loads once and every question after it rides free.
+
+| Repository | Correct (grep) | Correct (crux) | Tokens per correct answer |
+| --- | --- | --- | --- |
+| Django | 16/24 (67%) | **23/24 (96%)** | 29,380 vs 41,823 (**−30%**) |
+| SymPy | 12/24 (50%) | **20/24 (83%)** | 34,248 vs 82,822 (**−59%**) |
+
+Every crux session ran 13–14 turns with exactly 4 index calls. By question six, the premium over grep is +0.3%. One SymPy session scored 6/6 for 169,693 tokens — a perfect session on a 770k-line repository, cheaper than an average wrong-answer grep session.
+
+Read the [results post](https://halv.ai/blog/crux-sessions) and the [methodology deep-dive](https://halv.ai/blog/crux-sessions-deep-dive).
+
+### Single questions (crux 0.6)
+
+50 verifiable navigation questions, one per fresh session — the hardest setup for crux, because every answer pays the full setup cost alone.
 
 | Metric | grep only | with crux |
 | --- | --- | --- |
