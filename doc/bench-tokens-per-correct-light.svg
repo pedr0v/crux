@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="132" viewBox="0 0 720 132" role="img">
+<text x="158" y="21" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#59636e">grep · django</text>
+<rect x="168" y="8" width="217" height="18" rx="3" fill="#6b7280"/>
+<text x="393" y="21" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#1f2328">41,823</text>
+<text x="158" y="51" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#1f2328">crux · django</text>
+<rect x="168" y="38" width="153" height="18" rx="3" fill="#2a78d6"/>
+<text x="329" y="51" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#1f2328">29,380 (−30%)</text>
+<text x="158" y="81" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#59636e">grep · sympy</text>
+<rect x="168" y="68" width="430" height="18" rx="3" fill="#6b7280"/>
+<text x="606" y="81" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#1f2328">82,822</text>
+<text x="158" y="111" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#1f2328">crux · sympy</text>
+<rect x="168" y="98" width="178" height="18" rx="3" fill="#2a78d6"/>
+<text x="354" y="111" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#1f2328">34,248 (−59%)</text>
+</svg>

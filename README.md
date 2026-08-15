@@ -8,6 +8,11 @@
 | Tokens per correct answer | 59,394 | **31,644 (−47%)** |
 | On SymPy (770k lines) | 82,822 | **34,248 (−59%)** |
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/bench-tokens-per-correct-dark.svg">
+  <img src="doc/bench-tokens-per-correct-light.svg" alt="Tokens per correct answer: crux beats grep by 30% on Django and 59% on SymPy" width="720">
+</picture>
+
 The larger the codebase, the larger the gain. Full data: [results post](https://halv.ai/blog/crux-sessions) and [methodology deep-dive](https://halv.ai/blog/crux-sessions-deep-dive).
 
 ## What crux is
@@ -194,6 +199,13 @@ Six navigation questions per continuous session, four sessions per repository. T
 | --- | --- | --- | --- |
 | Django | 16/24 (67%) | **23/24 (96%)** | 29,380 vs 41,823 (**−30%**) |
 | SymPy | 12/24 (50%) | **20/24 (83%)** | 34,248 vs 82,822 (**−59%**) |
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="doc/bench-sympy-before-after-dark.svg">
+  <img src="doc/bench-sympy-before-after-light.svg" alt="SymPy total tokens: crux 0.6.1 used 2.25M, grep 994k, crux 0.6.2 uses 685k with more correct answers" width="720">
+</picture>
+
+Version 0.6.2 reshaped the query results for large repositories. The chart shows the effect on SymPy: 3.3× fewer tokens than 0.6.1, below the grep baseline, with more correct answers.
 
 Every crux session ran 13–14 turns with exactly 4 index calls. By question six, the premium over grep is +0.3%. One SymPy session scored 6/6 for 169,693 tokens — a perfect session on a 770k-line repository, cheaper than an average wrong-answer grep session.
 

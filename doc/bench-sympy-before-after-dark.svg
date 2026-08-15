@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="102" viewBox="0 0 720 102" role="img">
+<text x="158" y="21" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#9198a1">crux 0.6.1 · before</text>
+<rect x="168" y="8" width="430" height="18" rx="3" fill="#d95926"/>
+<text x="606" y="21" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#e6edf3">2,247,104 · 16/24</text>
+<text x="158" y="51" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#9198a1">grep baseline</text>
+<rect x="168" y="38" width="190" height="18" rx="3" fill="#9ca3af"/>
+<text x="366" y="51" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#e6edf3">993,865 · 12/24</text>
+<text x="158" y="81" text-anchor="end" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#e6edf3">crux 0.6.2 · after</text>
+<rect x="168" y="68" width="131" height="18" rx="3" fill="#3987e5"/>
+<text x="307" y="81" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" font-weight="600" fill="#e6edf3">684,953 · 20/24</text>
+</svg>
