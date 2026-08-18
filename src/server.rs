@@ -246,6 +246,61 @@ struct Server {
     profile: Profile,
     expanded: bool,
     list_changed_pending: bool,
+    savings_ledger: Option<SavingsLedger>,
+}
+
+/// Appends one JSON line per successful tool call to the file named by
+/// CRUX_SAVINGS_LEDGER. Host applications (for example Halv) read the file
+/// to attribute crux token savings to a session. Unset variable = no-op.
+struct SavingsLedger {
+    path: std::path::PathBuf,
+}
+
+impl SavingsLedger {
+    fn from_environment() -> Option<Self> {
+        let path = std::env::var_os("CRUX_SAVINGS_LEDGER")?;
+        if path.is_empty() {
+            return None;
+        }
+        Some(Self {
+            path: std::path::PathBuf::from(path),
+        })
+    }
+
+    /// Paired Codex CLI benchmarks (Django + SymPy, 48 questions) measured
+    /// a grep baseline at 1.88x the crux session tokens per correct answer.
+    /// The estimate books 0.8x the response tokens as saved - a floor below
+    /// both measured repositories (0.88x and 1.42x).
+    fn record(&self, tool: &str, response: &str) {
+        let response_tokens = (response.len() / 4) as u64;
+        let saved_tokens = response_tokens * 4 / 5;
+        if saved_tokens == 0 {
+            return;
+        }
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        let line = json!({
+            "ts": timestamp,
+            "tool": tool,
+            "response_tokens": response_tokens,
+            "saved_tokens": saved_tokens,
+        })
+        .to_string();
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        else {
+            return;
+        };
+        use std::io::Write as _;
+        let _ = writeln!(file, "{line}");
+    }
 }
 
 impl Default for Server {
@@ -261,6 +316,7 @@ impl Server {
             profile,
             expanded: profile == Profile::Full,
             list_changed_pending: false,
+            savings_ledger: SavingsLedger::from_environment(),
         }
     }
 
@@ -426,7 +482,13 @@ impl Server {
                     .pointer("/params/arguments")
                     .cloned()
                     .unwrap_or_else(|| json!({}));
-                rpc_success(id, self.call_tool(name, &arguments).into_json())
+                let result = self.call_tool(name, &arguments);
+                if !result.is_error {
+                    if let Some(ledger) = &self.savings_ledger {
+                        ledger.record(name, &result.text);
+                    }
+                }
+                rpc_success(id, result.into_json())
             }
             "ping" => rpc_success(id, json!({})),
             _ => rpc_error(id, -32601, "method not found"),
@@ -832,6 +894,31 @@ mod tests {
     fn write_test_index(project: &TestProject, index: &Index) {
         let bytes = index.write_to_bytes().expect("serialize test index");
         fs::write(project.root.join(".scip-nav/index.scip"), bytes).expect("write test index");
+    }
+
+    #[test]
+    fn savings_ledger_records_successful_tool_calls_as_json_lines() {
+        let project = TestProject::new();
+        let ledger_path = project.root.join("ledger/savings.jsonl");
+        let ledger = SavingsLedger {
+            path: ledger_path.clone(),
+        };
+
+        ledger.record("scip_map", &"x".repeat(400));
+        ledger.record("scip_find", &"y".repeat(40));
+        // Tiny responses save nothing and write nothing.
+        ledger.record("scip_find", "ok");
+
+        let lines = fs::read_to_string(&ledger_path)
+            .expect("ledger file should exist")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("ledger line should be JSON"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["tool"], "scip_map");
+        assert_eq!(lines[0]["response_tokens"], 100);
+        assert_eq!(lines[0]["saved_tokens"], 80);
+        assert_eq!(lines[1]["saved_tokens"], 8);
     }
 
     #[test]
