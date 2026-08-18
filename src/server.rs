@@ -483,7 +483,9 @@ impl Server {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 let result = self.call_tool(name, &arguments);
-                if !result.is_error {
+                // scip_index is a build step, not an answer; recording it
+                // would book savings for work the agent never avoided.
+                if !result.is_error && name != "scip_index" {
                     if let Some(ledger) = &self.savings_ledger {
                         ledger.record(name, &result.text);
                     }
