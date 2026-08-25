@@ -63,6 +63,8 @@ struct IndexArgs {
     #[serde(default)]
     language: Option<String>,
     #[serde(default)]
+    languages: Option<Vec<String>>,
+    #[serde(default)]
     max_file_mb: Option<u64>,
 }
 
@@ -335,6 +337,7 @@ impl Server {
                 run_indexer(
                     Path::new(&arguments.project_root),
                     arguments.language.as_deref(),
+                    arguments.languages.as_deref(),
                     arguments.max_file_mb,
                     &mut self.cache,
                 )
@@ -537,7 +540,7 @@ fn slim_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "scip_index",
-            "description": "Builds or refreshes the code index for a project root — call once if another tool reports a missing index.",
+            "description": "Builds or refreshes a project code index after another tool reports a missing index.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -546,11 +549,16 @@ fn slim_tool_definitions() -> Vec<Value> {
                     },
                     "language": {
                         "type": "string",
-                        "description": "Optional language override."
+                        "description": "One language name."
+                    },
+                    "languages": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Language name list."
                     },
                     "max_file_mb": {
                         "type": "integer",
-                        "description": "TypeScript file limit in MB."
+                        "description": "TypeScript MB limit."
                     }
                 }),
                 required_fields("scip_index")
