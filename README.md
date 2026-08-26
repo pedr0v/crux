@@ -13,7 +13,7 @@
   <img src="doc/bench-tokens-per-correct-light.svg" alt="Tokens per correct answer: crux beats grep by 30% on Django and 59% on SymPy" width="720">
 </picture>
 
-The larger the codebase, the larger the gain. Full data: [results post](https://halv.ai/blog/crux-sessions) and [methodology deep-dive](https://halv.ai/blog/crux-sessions-deep-dive).
+The larger the codebase, the larger the gain. The benchmark section contains the full data.
 
 ## What crux is
 
@@ -50,8 +50,6 @@ cargo install --git https://github.com/pedr0v/crux
 
 Run `crux self-update` to install the latest standalone version.
 Run `crux self-update --check` to check for an update without an installation.
-Halv updates its bundled crux through the app updater.
-
 ## Setup
 
 ### Codex CLI
@@ -209,8 +207,6 @@ Version 0.6.2 reshaped the query results for large repositories. The chart shows
 
 Every crux session ran 13–14 turns with exactly 4 index calls. By question six, the premium over grep is +0.3%. One SymPy session scored 6/6 for 169,693 tokens — a perfect session on a 770k-line repository, cheaper than an average wrong-answer grep session.
 
-Read the [results post](https://halv.ai/blog/crux-sessions) and the [methodology deep-dive](https://halv.ai/blog/crux-sessions-deep-dive).
-
 ### Single questions (crux 0.6)
 
 50 verifiable navigation questions, one per fresh session — the hardest setup for crux, because every answer pays the full setup cost alone.
@@ -223,10 +219,6 @@ Read the [results post](https://halv.ai/blog/crux-sessions) and the [methodology
 
 On definition lookups, the agent skips the index (0 calls, cost parity); the gains come from callers and reference questions.
 
-Read the [accessible post](https://halv.ai/blog/crux-benchmark) and the [methodology deep-dive](https://halv.ai/blog/crux-benchmark-deep-dive).
+## Privacy
 
-## crux and Halv
-
-crux has the MIT license. crux is fully local. It operates on one repository in one session. All operations occur on your machine. crux sends no telemetry.
-
-[Halv](https://halv.ai) includes crux. Halv adds these functions: cache between sessions, measurement of saved tokens, multi-repository indexes, and hosted indexes for teams.
+Crux operates locally on one repository during each session. It sends no telemetry.

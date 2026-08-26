@@ -425,6 +425,7 @@ fn detect_languages(project_root: &Path) -> Vec<Language> {
 struct LanguageSelection {
     languages: Vec<Language>,
     also_detected: Vec<Language>,
+    requested_but_not_detected: Vec<Language>,
 }
 
 fn select_languages(
@@ -446,6 +447,7 @@ fn select_languages(
         return Ok(LanguageSelection {
             languages,
             also_detected,
+            requested_but_not_detected: Vec::new(),
         });
     }
 
@@ -454,13 +456,35 @@ fn select_languages(
             bail!("languages must contain at least one language");
         }
 
-        let mut languages = Vec::new();
+        let mut requested = Vec::new();
         for language in override_languages {
             let language = parse_language(language)?;
-            if !languages.contains(&language) {
-                languages.push(language);
+            if !requested.contains(&language) {
+                requested.push(language);
             }
         }
+
+        let languages = requested
+            .iter()
+            .copied()
+            .filter(|language| detected.contains(language))
+            .collect::<Vec<_>>();
+        let requested_but_not_detected = requested
+            .iter()
+            .copied()
+            .filter(|language| !detected.contains(language))
+            .collect::<Vec<_>>();
+        if languages.is_empty() {
+            let requested = requested
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "project root has no marker file for any requested language: {requested}. A marker file must exist at the project root."
+            );
+        }
+
         let also_detected = detected
             .into_iter()
             .filter(|language| !languages.contains(language))
@@ -468,6 +492,7 @@ fn select_languages(
         return Ok(LanguageSelection {
             languages,
             also_detected,
+            requested_but_not_detected,
         });
     }
 
@@ -480,6 +505,7 @@ fn select_languages(
     Ok(LanguageSelection {
         languages: detected,
         also_detected: Vec::new(),
+        requested_but_not_detected: Vec::new(),
     })
 }
 
@@ -524,6 +550,18 @@ fn format_index_stats(
             .join(", ");
         output.push_str(&format!(
             "\nalso detected: {also_detected} — pass language to index it"
+        ));
+    }
+
+    if !selection.requested_but_not_detected.is_empty() {
+        let requested_but_not_detected = selection
+            .requested_but_not_detected
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        output.push_str(&format!(
+            "\nrequested but not detected: {requested_but_not_detected}"
         ));
     }
 
@@ -1012,6 +1050,7 @@ mod tests {
             &LanguageSelection {
                 languages: vec![Language::TypeScript],
                 also_detected: Vec::new(),
+                requested_but_not_detected: Vec::new(),
             },
             &merged.warnings,
         );
@@ -1335,6 +1374,7 @@ exit 23
             vec![Language::TypeScript, Language::Rust, Language::Dart]
         );
         assert!(selection.also_detected.is_empty());
+        assert!(selection.requested_but_not_detected.is_empty());
         assert_eq!(
             format_index_stats(
                 IndexStats {
@@ -1364,6 +1404,90 @@ exit 23
             select_languages(&project.root, Some("python"), None).expect("override language");
         assert_eq!(selection.languages, vec![Language::Python]);
         assert_eq!(selection.also_detected, vec![Language::Rust]);
+        assert!(selection.requested_but_not_detected.is_empty());
+    }
+
+    #[test]
+    fn language_list_keeps_requested_order_and_collapses_duplicates() {
+        let project = TestProject::new();
+        fs::write(project.root.join("package.json"), "{}").expect("write TypeScript marker");
+        fs::write(project.root.join("Cargo.toml"), "").expect("write Rust marker");
+        let languages = vec![
+            "rust".to_string(),
+            "typescript".to_string(),
+            "rust".to_string(),
+        ];
+
+        let selection = select_languages(&project.root, None, Some(&languages))
+            .expect("filter requested languages");
+
+        assert_eq!(
+            selection.languages,
+            vec![Language::Rust, Language::TypeScript]
+        );
+        assert!(selection.also_detected.is_empty());
+        assert!(selection.requested_but_not_detected.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn language_list_filters_undetected_languages_and_reports_them() {
+        let project = TestProject::new();
+        disable_update_check(&project);
+        fs::write(project.root.join("Cargo.toml"), "").expect("write Rust marker");
+        let project_root = project.root.to_string_lossy();
+        let rust_source = project.root.join("rust.scip");
+        write_index_file(
+            &rust_source,
+            &test_index(&project_root, "rust", &["src/lib.rs"], &[]),
+        );
+        let languages = vec!["rust".to_string(), "typescript".to_string()];
+
+        let stats = run_indexer_with(
+            &project.root,
+            None,
+            Some(&languages),
+            None,
+            &mut IndexCache::default(),
+            |language, _, output, _| {
+                assert_eq!(language, Language::Rust);
+                copy_index_command(&rust_source, output)
+            },
+        )
+        .expect("index detected requested language");
+
+        assert!(language_index_path(&project.root, Language::Rust).is_file());
+        assert!(!language_index_path(&project.root, Language::TypeScript).exists());
+        assert!(stats.contains("indexed: rust 1 documents"));
+        assert_eq!(
+            stats
+                .lines()
+                .find(|line| line.starts_with("requested but not detected:")),
+            Some("requested but not detected: typescript")
+        );
+    }
+
+    #[test]
+    fn language_list_without_detected_markers_writes_no_index() {
+        let project = TestProject::new();
+        let languages = vec!["rust".to_string()];
+
+        let error = run_indexer_with(
+            &project.root,
+            None,
+            Some(&languages),
+            None,
+            &mut IndexCache::default(),
+            |_, _, _, _| panic!("empty language intersection must not run an indexer"),
+        )
+        .expect_err("missing marker must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "project root has no marker file for any requested language: rust. A marker file must exist at the project root."
+        );
+        assert!(!language_index_path(&project.root, Language::Rust).exists());
+        assert!(!index_path(&project.root).exists());
     }
 
     #[cfg(unix)]
@@ -1480,7 +1604,7 @@ exit 23
     #[test]
     fn language_list_rejects_unknown_language() {
         let project = TestProject::new();
-        let languages = vec!["go".to_string()];
+        let languages = vec!["notalanguage".to_string()];
         let error = run_indexer_with(
             &project.root,
             None,
@@ -1493,7 +1617,7 @@ exit 23
 
         assert_eq!(
             error.to_string(),
-            "unsupported language: go (expected typescript|python|rust|dart|java|cpp)"
+            "unsupported language: notalanguage (expected typescript|python|rust|dart|java|cpp)"
         );
     }
 
