@@ -251,9 +251,10 @@ struct Server {
     savings_ledger: Option<SavingsLedger>,
 }
 
-/// Appends one JSON line per successful tool call to the file named by
-/// CRUX_SAVINGS_LEDGER. Host applications (for example Halv) read the file
-/// to attribute crux token savings to a session. Unset variable = no-op.
+/// The ledger appends one JSON line per successful tool call.
+/// CRUX_SAVINGS_LEDGER sets the file path.
+/// External tools can attribute Crux token savings to a session from this file.
+/// An unset variable disables the ledger.
 struct SavingsLedger {
     path: std::path::PathBuf,
 }
