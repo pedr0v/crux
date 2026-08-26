@@ -136,7 +136,7 @@ You can also set `CRUX_PROFILE=full`. The `--profile` flag overrides the environ
 
 | Tool | Function |
 | --- | --- |
-| `scip_index` | Finds the project language. Creates or refreshes the SCIP index. |
+| `scip_index` | Finds project languages and sub-projects. Creates or refreshes the merged SCIP index. |
 | `scip_find` | Finds symbol candidates by name. It can find unreferenced symbols. |
 | `scip_map` | Shows definitions, signatures, reference sites, and callers for a maximum of eight symbol names. |
 | `scip_outline` | Shows the definition structure of one file. |
@@ -158,7 +158,7 @@ Version 0.6.0 uses the four consolidated tools by default. The narrow tools rema
 
 | Old 0.5.x call | New 0.6.0 call |
 | --- | --- |
-| `scip_index { project_root, language?, max_file_mb? }` | Unchanged. |
+| `scip_index { project_root, language?, languages?, max_file_mb?, discover_depth? }` | Adds monorepo discovery. |
 | `scip_search { project_root, query, limit? }` | `scip_find { project_root, name: query, limit? }` |
 | `scip_def { project_root, name }` | `scip_map { project_root, names: [name] }` |
 | `scip_refs { project_root, name, limit? }` | `scip_map { project_root, names: [name], ref_limit: limit? }` |
@@ -182,6 +182,13 @@ The unreferenced query has no path or export filter.
 | Dart / Flutter | `scip_dart` | Run `dart pub global activate scip_dart`. |
 | Java / Kotlin | `scip-java` | Install [Coursier](https://get-coursier.io/). |
 | C / C++ | `scip-clang` | Supply a `compile_commands.json` compilation database. |
+
+Crux searches for language markers three directory levels below the project root.
+It runs each indexer from the sub-project that owns the marker.
+Crux rebases document paths and merges all results into one index.
+Set `discover_depth` to control the search depth. Set it to `0` to search only the project root.
+A directory that owns a language hides markers for the same language below it.
+Crux skips hidden directories, `node_modules`, `target`, `dist`, `build`, `out`, `vendor`, `venv`, and `__pycache__`.
 
 crux writes the index to `<project>/.scip-nav/index.scip`. Add `.scip-nav/` to your global gitignore file.
 

@@ -3,8 +3,8 @@ use crate::semantic::SemanticIndex;
 use crate::update;
 use anyhow::{anyhow, bail, Context, Result};
 use protobuf::{Message, MessageField};
-use scip::types::Index;
-use std::collections::{HashMap, HashSet};
+use scip::types::{Index, Metadata};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,14 @@ enum Language {
     Dart,
     Java,
     Cpp,
+}
+
+const DEFAULT_DISCOVER_DEPTH: u32 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SubProject {
+    relative: PathBuf,
+    language: Language,
 }
 
 impl Language {
@@ -247,16 +255,87 @@ fn pending_index_path(project_root: &Path) -> PathBuf {
     project_root.join(".scip-nav").join("index.scip.tmp")
 }
 
-fn language_index_path(project_root: &Path, language: Language) -> PathBuf {
-    project_root
-        .join(".scip-nav")
-        .join(format!("index-{language}.scip"))
+fn relative_path_argument(path: &Path) -> String {
+    path.iter()
+        .map(|component| component.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
-fn pending_language_index_path(project_root: &Path, language: Language) -> PathBuf {
+fn sub_project_slug(relative: &Path) -> String {
+    relative
+        .iter()
+        .map(|component| {
+            component
+                .to_string_lossy()
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("__")
+}
+
+trait IndexSubProject {
+    fn index_language(&self) -> Language;
+    fn index_relative(&self) -> &Path;
+}
+
+impl IndexSubProject for Language {
+    fn index_language(&self) -> Language {
+        *self
+    }
+
+    fn index_relative(&self) -> &Path {
+        Path::new("")
+    }
+}
+
+impl IndexSubProject for SubProject {
+    fn index_language(&self) -> Language {
+        self.language
+    }
+
+    fn index_relative(&self) -> &Path {
+        &self.relative
+    }
+}
+
+impl IndexSubProject for &SubProject {
+    fn index_language(&self) -> Language {
+        self.language
+    }
+
+    fn index_relative(&self) -> &Path {
+        &self.relative
+    }
+}
+
+fn language_index_file_name(sub_project: impl IndexSubProject) -> String {
+    let language = sub_project.index_language();
+    let relative = sub_project.index_relative();
+    if relative.as_os_str().is_empty() {
+        format!("index-{language}.scip")
+    } else {
+        format!("index-{}-{}.scip", language, sub_project_slug(relative))
+    }
+}
+
+fn language_index_path(project_root: &Path, sub_project: impl IndexSubProject) -> PathBuf {
     project_root
         .join(".scip-nav")
-        .join(format!("index-{language}.scip.tmp"))
+        .join(language_index_file_name(sub_project))
+}
+
+fn pending_language_index_path(project_root: &Path, sub_project: impl IndexSubProject) -> PathBuf {
+    let destination = language_index_path(project_root, sub_project);
+    destination.with_extension("scip.tmp")
 }
 
 fn path_argument(path: &Path) -> String {
@@ -408,44 +487,149 @@ fn parse_language(language: &str) -> Result<Language> {
     }
 }
 
-fn detect_languages(project_root: &Path) -> Vec<Language> {
+fn skip_discovery_directory(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | "out"
+                | "vendor"
+                | "venv"
+                | "__pycache__"
+        )
+}
+
+fn language_registry_position(language: Language) -> usize {
     LANGUAGE_INDEXERS
         .iter()
-        .filter(|indexer| {
-            indexer
+        .position(|indexer| indexer.language == language)
+        .expect("all languages have an indexer")
+}
+
+fn discover_sub_projects(project_root: &Path, depth: u32) -> Result<Vec<SubProject>> {
+    let mut queue = VecDeque::from([(PathBuf::new(), 0, Vec::<Language>::new())]);
+    let mut sub_projects = Vec::new();
+
+    while let Some((relative, current_depth, inherited_languages)) = queue.pop_front() {
+        let directory = project_root.join(&relative);
+        let mut owned_languages = inherited_languages;
+
+        for indexer in LANGUAGE_INDEXERS {
+            if owned_languages.contains(&indexer.language) {
+                continue;
+            }
+            if indexer
                 .markers
                 .iter()
-                .any(|marker| project_root.join(marker).is_file())
+                .any(|marker| directory.join(marker).is_file())
+            {
+                sub_projects.push(SubProject {
+                    relative: relative.clone(),
+                    language: indexer.language,
+                });
+                owned_languages.push(indexer.language);
+            }
+        }
+
+        if current_depth == depth {
+            continue;
+        }
+
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if relative.as_os_str().is_empty() => {
+                return Err(error)
+                    .with_context(|| format!("read directory {}", directory.display()));
+            }
+            Err(_) => continue,
+        };
+        let mut child_directories = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            if skip_discovery_directory(&name.to_string_lossy()) {
+                continue;
+            }
+            child_directories.push(name);
+        }
+        child_directories.sort();
+
+        for child in child_directories {
+            queue.push_back((
+                relative.join(child),
+                current_depth + 1,
+                owned_languages.clone(),
+            ));
+        }
+    }
+
+    sub_projects.sort_by(|left, right| {
+        left.relative.cmp(&right.relative).then_with(|| {
+            language_registry_position(left.language)
+                .cmp(&language_registry_position(right.language))
         })
-        .map(|indexer| indexer.language)
-        .collect()
+    });
+    Ok(sub_projects)
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct LanguageSelection {
     languages: Vec<Language>,
+    sub_projects: Vec<SubProject>,
     also_detected: Vec<Language>,
     requested_but_not_detected: Vec<Language>,
 }
 
 fn select_languages(
-    project_root: &Path,
+    discovered: Vec<SubProject>,
     override_language: Option<&str>,
     override_languages: Option<&[String]>,
+    discover_depth: u32,
 ) -> Result<LanguageSelection> {
     if override_language.is_some() && override_languages.is_some() {
         bail!("pass only one of language or languages");
     }
 
-    let detected = detect_languages(project_root);
+    let detected = LANGUAGE_INDEXERS
+        .iter()
+        .map(|indexer| indexer.language)
+        .filter(|language| {
+            discovered
+                .iter()
+                .any(|sub_project| sub_project.language == *language)
+        })
+        .collect::<Vec<_>>();
     if let Some(override_language) = override_language {
         let languages = vec![parse_language(override_language)?];
         let also_detected = detected
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|language| !languages.contains(language))
             .collect();
+        let mut sub_projects = discovered
+            .into_iter()
+            .filter(|sub_project| languages.contains(&sub_project.language))
+            .collect::<Vec<_>>();
+        if sub_projects.is_empty() {
+            sub_projects.push(SubProject {
+                relative: PathBuf::new(),
+                language: languages[0],
+            });
+        }
         return Ok(LanguageSelection {
             languages,
+            sub_projects,
             also_detected,
             requested_but_not_detected: Vec::new(),
         });
@@ -481,16 +665,21 @@ fn select_languages(
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
-                "project root has no marker file for any requested language: {requested}. A marker file must exist at the project root."
+                "no marker file for any requested language within {discover_depth} directory levels: {requested}"
             );
         }
 
+        let sub_projects = discovered
+            .into_iter()
+            .filter(|sub_project| languages.contains(&sub_project.language))
+            .collect();
         let also_detected = detected
             .into_iter()
             .filter(|language| !languages.contains(language))
             .collect();
         return Ok(LanguageSelection {
             languages,
+            sub_projects,
             also_detected,
             requested_but_not_detected,
         });
@@ -498,12 +687,13 @@ fn select_languages(
 
     if detected.is_empty() {
         bail!(
-            "could not auto-detect a supported language — add a project marker or pass language (typescript|python|rust|dart|java|cpp)"
+            "could not auto-detect a supported language within {discover_depth} directory levels — add a project marker, raise discover_depth, or pass language (typescript|python|rust|dart|java|cpp)"
         );
     }
 
     Ok(LanguageSelection {
         languages: detected,
+        sub_projects: discovered,
         also_detected: Vec::new(),
         requested_but_not_detected: Vec::new(),
     })
@@ -511,12 +701,22 @@ fn select_languages(
 
 struct LanguageIndexResult {
     language: Language,
+    relative: PathBuf,
     documents: usize,
 }
 
 struct LanguageIndexFailure {
     language: Language,
+    relative: PathBuf,
     message: String,
+}
+
+fn sub_project_suffix(relative: &Path) -> String {
+    if relative.as_os_str().is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", relative_path_argument(relative))
+    }
 }
 
 fn format_index_stats(
@@ -528,7 +728,14 @@ fn format_index_stats(
 ) -> String {
     let indexed = successes
         .iter()
-        .map(|result| format!("{} {} documents", result.language, result.documents))
+        .map(|result| {
+            format!(
+                "{} {} documents{}",
+                result.language,
+                result.documents,
+                sub_project_suffix(&result.relative)
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let mut output = format!("indexed: {indexed} | merged: {}", stats.compact());
@@ -536,7 +743,14 @@ fn format_index_stats(
     if !failures.is_empty() {
         let failures = failures
             .iter()
-            .map(|failure| format!("{} ({})", failure.language, failure.message))
+            .map(|failure| {
+                format!(
+                    "{} ({}){}",
+                    failure.language,
+                    failure.message,
+                    sub_project_suffix(&failure.relative)
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
         output.push_str(&format!("\nfailed: {failures}"));
@@ -727,6 +941,60 @@ fn language_index_paths(project_root: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn language_index_file_matches(file_name: &str, language: Language) -> bool {
+    let stem = format!("index-{language}");
+    file_name == format!("{stem}.scip")
+        || file_name
+            .strip_prefix(&format!("{stem}-"))
+            .and_then(|slug| slug.strip_suffix(".scip"))
+            .is_some_and(|slug| !slug.is_empty())
+}
+
+fn cleanup_stale_language_indexes(
+    project_root: &Path,
+    selected_languages: &[Language],
+    successes: &[LanguageIndexResult],
+    failures: &[LanguageIndexFailure],
+) -> Result<()> {
+    let expected_file_names = successes
+        .iter()
+        .map(|result| SubProject {
+            relative: result.relative.clone(),
+            language: result.language,
+        })
+        .chain(failures.iter().map(|failure| SubProject {
+            relative: failure.relative.clone(),
+            language: failure.language,
+        }))
+        .map(|sub_project| language_index_file_name(&sub_project))
+        .collect::<HashSet<_>>();
+    let directory = project_root.join(".scip-nav");
+    let entries =
+        fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?;
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("read {}", directory.display()))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("read file type for {}", entry.path().display()))?
+            .is_file()
+        {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        if selected_languages
+            .iter()
+            .copied()
+            .any(|language| language_index_file_matches(&file_name, language))
+            && !expected_file_names.contains(&file_name)
+        {
+            fs::remove_file(entry.path())
+                .with_context(|| format!("remove stale index {}", entry.path().display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn write_index_atomically(index: &Index, pending_path: &Path, destination: &Path) -> Result<()> {
     remove_file_if_present(pending_path)?;
     let bytes = index.write_to_bytes().context("serialize merged index")?;
@@ -765,8 +1033,9 @@ fn merge_language_indexes(
     let mut indexes = Vec::with_capacity(paths.len());
     for path in paths {
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let index =
+        let mut index =
             Index::parse_from_bytes(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        set_index_project_root(&mut index, project_root);
         indexes.push(index);
     }
 
@@ -781,16 +1050,45 @@ fn merge_language_indexes(
     Ok((loaded, merged.warnings))
 }
 
+fn set_index_project_root(index: &mut Index, project_root: &Path) {
+    let project_root = format!("file://{}", project_root.display());
+    if let Some(metadata) = index.metadata.as_mut() {
+        metadata.project_root = project_root;
+    } else {
+        index.metadata = MessageField::some(Metadata {
+            project_root,
+            ..Default::default()
+        });
+    }
+}
+
+fn rebase_index(index: &mut Index, project_root: &Path, sub_project: &SubProject) {
+    if !sub_project.relative.as_os_str().is_empty() {
+        let prefix = relative_path_argument(&sub_project.relative);
+        for document in &mut index.documents {
+            document.relative_path = format!("{prefix}/{}", document.relative_path);
+        }
+    }
+
+    set_index_project_root(index, project_root);
+}
+
 fn build_index(
     project_root: &Path,
-    language: Language,
+    sub_project: impl IndexSubProject,
     command: IndexerCommand,
 ) -> Result<LoadedIndex> {
-    let pending_path = pending_language_index_path(project_root, language);
+    let sub_project = SubProject {
+        relative: sub_project.index_relative().to_path_buf(),
+        language: sub_project.index_language(),
+    };
+    let language = sub_project.language;
+    let pending_path = pending_language_index_path(project_root, &sub_project);
     remove_file_if_present(&pending_path)?;
 
     let (program, args) = command;
-    let output = match execute_indexer_command(&program, &args, project_root, language) {
+    let sub_project_root = project_root.join(&sub_project.relative);
+    let output = match execute_indexer_command(&program, &args, &sub_project_root, language) {
         Ok(output) => output,
         Err(error) => {
             return match remove_file_if_present(&pending_path) {
@@ -804,8 +1102,8 @@ fn build_index(
         return Err(indexer_failure(language, &output, None, &pending_path));
     }
 
-    let loaded = match load_uncached_index(&pending_path) {
-        Ok(loaded) if !loaded.index.index().documents.is_empty() => loaded,
+    let mut index = match load_uncached_index(&pending_path) {
+        Ok(loaded) if !loaded.index.index().documents.is_empty() => loaded.index.index().clone(),
         Ok(_) => {
             return Err(indexer_failure(
                 language,
@@ -825,7 +1123,30 @@ fn build_index(
         }
     };
 
-    let destination = language_index_path(project_root, language);
+    rebase_index(&mut index, project_root, &sub_project);
+    let bytes = match index.write_to_bytes() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let detail = format!("could not serialize rebased output index: {error:#}");
+            return Err(indexer_failure(
+                language,
+                &output,
+                Some(&detail),
+                &pending_path,
+            ));
+        }
+    };
+    if let Err(error) = fs::write(&pending_path, bytes) {
+        let detail = format!("could not write rebased output index: {error}");
+        return Err(indexer_failure(
+            language,
+            &output,
+            Some(&detail),
+            &pending_path,
+        ));
+    }
+
+    let destination = language_index_path(project_root, &sub_project);
     if let Err(error) = fs::rename(&pending_path, &destination) {
         let detail = format!(
             "replace {} with {}: {error}",
@@ -840,7 +1161,7 @@ fn build_index(
         ));
     }
 
-    Ok(loaded)
+    load_uncached_index(&destination)
 }
 
 pub(crate) fn run_indexer(
@@ -848,6 +1169,7 @@ pub(crate) fn run_indexer(
     override_language: Option<&str>,
     override_languages: Option<&[String]>,
     max_file_mb: Option<u64>,
+    discover_depth: Option<u32>,
     cache: &mut IndexCache,
 ) -> Result<String> {
     run_indexer_with(
@@ -855,6 +1177,7 @@ pub(crate) fn run_indexer(
         override_language,
         override_languages,
         max_file_mb,
+        discover_depth,
         cache,
         indexer_command,
     )
@@ -865,6 +1188,7 @@ fn run_indexer_with<F>(
     override_language: Option<&str>,
     override_languages: Option<&[String]>,
     max_file_mb: Option<u64>,
+    discover_depth: Option<u32>,
     cache: &mut IndexCache,
     mut command_builder: F,
 ) -> Result<String>
@@ -875,32 +1199,52 @@ where
     if max_file_mb == Some(0) {
         bail!("max_file_mb must be at least 1");
     }
-    let selection = select_languages(project_root, override_language, override_languages)?;
+    let discover_depth = discover_depth.unwrap_or(DEFAULT_DISCOVER_DEPTH);
+    let discovered = discover_sub_projects(project_root, discover_depth)?;
+    let selection = select_languages(
+        discovered,
+        override_language,
+        override_languages,
+        discover_depth,
+    )?;
     fs::create_dir_all(project_root.join(".scip-nav"))
         .with_context(|| format!("create {}/.scip-nav", project_root.display()))?;
     let pending_update = update::start_background_check(&project_root.join(".scip-nav"));
     let mut successes = Vec::new();
     let mut failures = Vec::new();
 
-    for language in selection.languages.iter().copied() {
-        let pending_path = pending_language_index_path(project_root, language);
-        let command = command_builder(language, project_root, &pending_path, max_file_mb);
-        match build_index(project_root, language, command) {
+    for sub_project in &selection.sub_projects {
+        let language = sub_project.language;
+        let pending_path = pending_language_index_path(project_root, sub_project);
+        let sub_project_root = project_root.join(&sub_project.relative);
+        let command = command_builder(language, &sub_project_root, &pending_path, max_file_mb);
+        match build_index(project_root, sub_project, command) {
             Ok(loaded) => successes.push(LanguageIndexResult {
                 language,
+                relative: sub_project.relative.clone(),
                 documents: loaded.index.index().documents.len(),
             }),
             Err(error) => failures.push(LanguageIndexFailure {
                 language,
+                relative: sub_project.relative.clone(),
                 message: format!("{error:#}"),
             }),
         }
     }
 
+    cleanup_stale_language_indexes(project_root, &selection.languages, &successes, &failures)?;
+
     if successes.is_empty() {
         let failures = failures
             .iter()
-            .map(|failure| format!("{} ({})", failure.language, failure.message))
+            .map(|failure| {
+                format!(
+                    "{} ({}){}",
+                    failure.language,
+                    failure.message,
+                    sub_project_suffix(&failure.relative)
+                )
+            })
             .collect::<Vec<_>>()
             .join("; ");
         bail!("all selected languages failed: {failures}");
@@ -1044,11 +1388,16 @@ mod tests {
             },
             &[LanguageIndexResult {
                 language: Language::TypeScript,
+                relative: PathBuf::new(),
                 documents: 1,
             }],
             &[],
             &LanguageSelection {
                 languages: vec![Language::TypeScript],
+                sub_projects: vec![SubProject {
+                    relative: PathBuf::new(),
+                    language: Language::TypeScript,
+                }],
                 also_detected: Vec::new(),
                 requested_but_not_detected: Vec::new(),
             },
@@ -1324,10 +1673,16 @@ exit 23
             .expect("successful indexer should replace the index");
 
         assert_eq!(loaded.index.index().documents.len(), 7);
+        let stored = read_index_file(&destination);
         assert_eq!(
-            fs::read(&destination).expect("read replacement index"),
-            replacement
+            stored
+                .metadata
+                .as_ref()
+                .expect("stored metadata")
+                .project_root,
+            format!("file://{}", project.root.display())
         );
+        assert_eq!(stored.documents.len(), 7);
         assert!(!pending_language_index_path(&project.root, Language::Python).exists());
         merge_language_indexes(&project.root, &mut cache).expect("merge replacement index");
         assert_eq!(
@@ -1343,6 +1698,283 @@ exit 23
     }
 
     #[test]
+    fn discovery_returns_root_first_and_sorts_nested_sub_projects() {
+        let project = TestProject::new();
+        fs::write(project.root.join("package.json"), "{}").expect("write root marker");
+        fs::create_dir_all(project.root.join("a")).expect("create a");
+        fs::write(project.root.join("a/package.json"), "{}").expect("write owned marker");
+        fs::write(project.root.join("a/Cargo.toml"), "").expect("write Rust marker");
+        fs::create_dir_all(project.root.join("b")).expect("create b");
+        fs::write(project.root.join("b/pyproject.toml"), "").expect("write Python marker");
+
+        let discovered = discover_sub_projects(&project.root, DEFAULT_DISCOVER_DEPTH)
+            .expect("discover sub-projects");
+
+        assert_eq!(
+            discovered,
+            vec![
+                SubProject {
+                    relative: PathBuf::new(),
+                    language: Language::TypeScript,
+                },
+                SubProject {
+                    relative: PathBuf::from("a"),
+                    language: Language::Rust,
+                },
+                SubProject {
+                    relative: PathBuf::from("b"),
+                    language: Language::Python,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_prunes_owned_languages_but_keeps_other_languages() {
+        let rust_project = TestProject::new();
+        fs::write(rust_project.root.join("Cargo.toml"), "").expect("write root marker");
+        fs::create_dir_all(rust_project.root.join("crates/a")).expect("create crate");
+        fs::write(rust_project.root.join("crates/a/Cargo.toml"), "").expect("write nested marker");
+
+        assert_eq!(
+            discover_sub_projects(&rust_project.root, DEFAULT_DISCOVER_DEPTH)
+                .expect("discover Rust project"),
+            vec![SubProject {
+                relative: PathBuf::new(),
+                language: Language::Rust,
+            }]
+        );
+
+        let mixed_project = TestProject::new();
+        fs::create_dir_all(mixed_project.root.join("app/src-tauri")).expect("create mixed project");
+        fs::write(mixed_project.root.join("app/package.json"), "{}")
+            .expect("write TypeScript marker");
+        fs::write(mixed_project.root.join("app/src-tauri/Cargo.toml"), "")
+            .expect("write Rust marker");
+
+        assert_eq!(
+            discover_sub_projects(&mixed_project.root, DEFAULT_DISCOVER_DEPTH)
+                .expect("discover mixed project"),
+            vec![
+                SubProject {
+                    relative: PathBuf::from("app"),
+                    language: Language::TypeScript,
+                },
+                SubProject {
+                    relative: PathBuf::from("app/src-tauri"),
+                    language: Language::Rust,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn discovery_honors_skipped_directories_and_depth() {
+        let project = TestProject::new();
+        fs::write(project.root.join("package.json"), "{}").expect("write root marker");
+        fs::create_dir_all(project.root.join("node_modules/x")).expect("create node_modules");
+        fs::write(project.root.join("node_modules/x/package.json"), "{}")
+            .expect("write skipped package marker");
+        fs::create_dir_all(project.root.join(".hidden")).expect("create hidden directory");
+        fs::write(project.root.join(".hidden/Cargo.toml"), "").expect("write hidden marker");
+        fs::create_dir_all(project.root.join("a/b/c/d")).expect("create deep directory");
+        fs::write(project.root.join("a/b/c/d/Cargo.toml"), "").expect("write deep marker");
+
+        assert_eq!(
+            discover_sub_projects(&project.root, 0).expect("discover root"),
+            vec![SubProject {
+                relative: PathBuf::new(),
+                language: Language::TypeScript,
+            }]
+        );
+        assert_eq!(
+            discover_sub_projects(&project.root, 3).expect("discover depth three"),
+            vec![SubProject {
+                relative: PathBuf::new(),
+                language: Language::TypeScript,
+            }]
+        );
+        assert_eq!(
+            discover_sub_projects(&project.root, 4).expect("discover depth four"),
+            vec![
+                SubProject {
+                    relative: PathBuf::new(),
+                    language: Language::TypeScript,
+                },
+                SubProject {
+                    relative: PathBuf::from("a/b/c/d"),
+                    language: Language::Rust,
+                },
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_unreadable_directory_and_finds_sibling_sub_project() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let project = TestProject::new();
+        if fs::metadata(&project.root)
+            .expect("read project metadata")
+            .uid()
+            == 0
+        {
+            return;
+        }
+
+        let unreadable = project.root.join("unreadable");
+        fs::create_dir(&unreadable).expect("create unreadable directory");
+        fs::write(unreadable.join("Cargo.toml"), "").expect("write unreadable marker");
+
+        let sibling = project.root.join("sibling");
+        fs::create_dir(&sibling).expect("create sibling directory");
+        fs::write(sibling.join("pyproject.toml"), "").expect("write sibling marker");
+
+        let original_permissions = fs::metadata(&unreadable)
+            .expect("read unreadable directory permissions")
+            .permissions();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000))
+            .expect("remove directory permissions");
+
+        let discovered = discover_sub_projects(&project.root, DEFAULT_DISCOVER_DEPTH);
+
+        fs::set_permissions(&unreadable, original_permissions)
+            .expect("restore directory permissions");
+        assert_eq!(
+            discovered.expect("discover sibling sub-project"),
+            vec![SubProject {
+                relative: PathBuf::from("sibling"),
+                language: Language::Python,
+            }]
+        );
+    }
+
+    #[test]
+    fn slug_replaces_separators_and_unsupported_characters() {
+        let sub_project = SubProject {
+            relative: PathBuf::from("services/api weird@v1.0"),
+            language: Language::Rust,
+        };
+
+        assert_eq!(
+            language_index_file_name(&sub_project),
+            "index-rust-services__api_weird_v1.0.scip"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sub_project_indexing_rebases_documents_and_metadata() {
+        let project = TestProject::new();
+        disable_update_check(&project);
+        fs::create_dir_all(project.root.join("services/api")).expect("create service");
+        fs::write(project.root.join("services/api/Cargo.toml"), "").expect("write Rust marker");
+        let source = project.root.join("prepared.scip");
+        write_index_file(
+            &source,
+            &test_index("file:///whatever", "rust", &["src/main.rs"], &[]),
+        );
+        let expected_directory = project.root.join("services/api");
+
+        let stats = run_indexer_with(
+            &project.root,
+            None,
+            None,
+            None,
+            None,
+            &mut IndexCache::default(),
+            |language, directory, output, _| {
+                assert_eq!(language, Language::Rust);
+                assert_eq!(directory, expected_directory);
+                copy_index_command(&source, output)
+            },
+        )
+        .expect("index sub-project");
+
+        let merged = read_index_file(&index_path(&project.root));
+        assert_eq!(
+            merged.documents[0].relative_path,
+            "services/api/src/main.rs"
+        );
+        assert_eq!(
+            merged
+                .metadata
+                .as_ref()
+                .expect("merged metadata")
+                .project_root,
+            format!("file://{}", project.root.display())
+        );
+        assert!(stats.contains("rust 1 documents (services/api)"));
+        assert!(language_index_path(
+            &project.root,
+            &SubProject {
+                relative: PathBuf::from("services/api"),
+                language: Language::Rust,
+            }
+        )
+        .is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_cleanup_keeps_unselected_and_failed_sub_project_indexes() {
+        let project = TestProject::new();
+        disable_update_check(&project);
+        fs::create_dir_all(project.root.join("current")).expect("create current project");
+        fs::create_dir_all(project.root.join("failed")).expect("create failed project");
+        fs::write(project.root.join("current/Cargo.toml"), "").expect("write current marker");
+        fs::write(project.root.join("failed/Cargo.toml"), "").expect("write failed marker");
+        let directory = project.root.join(".scip-nav");
+        fs::create_dir_all(&directory).expect("create index directory");
+        let stale_path = directory.join("index-rust-old__crate.scip");
+        let unselected_path = directory.join("index-typescript.scip");
+        let failed_path = directory.join("index-rust-failed.scip");
+        write_index_file(
+            &stale_path,
+            &test_index("file:///old", "rust", &["old/crate/src/lib.rs"], &[]),
+        );
+        write_index_file(
+            &unselected_path,
+            &test_index("file:///old", "typescript", &["src/app.ts"], &[]),
+        );
+        write_index_file(
+            &failed_path,
+            &test_index("file:///old", "rust", &["failed/src/lib.rs"], &[]),
+        );
+        let source = project.root.join("current.scip");
+        write_index_file(
+            &source,
+            &test_index("file:///old", "rust", &["src/main.rs"], &[]),
+        );
+        let languages = vec!["rust".to_string()];
+
+        run_indexer_with(
+            &project.root,
+            None,
+            Some(&languages),
+            None,
+            None,
+            &mut IndexCache::default(),
+            |_, sub_project_root, output, _| {
+                if sub_project_root.ends_with("current") {
+                    copy_index_command(&source, output)
+                } else {
+                    (
+                        "sh".to_string(),
+                        vec!["-c".to_string(), "exit 17".to_string()],
+                    )
+                }
+            },
+        )
+        .expect("index current project");
+
+        assert!(!stale_path.exists());
+        assert!(unselected_path.exists());
+        assert!(failed_path.exists());
+    }
+
+    #[test]
     fn detection_recognizes_every_registered_marker() {
         for indexer in LANGUAGE_INDEXERS {
             for marker in indexer.markers {
@@ -1353,7 +1985,11 @@ exit 23
                 }
                 fs::write(marker_path, "").expect("write marker");
                 assert_eq!(
-                    detect_languages(&project.root),
+                    discover_sub_projects(&project.root, 0)
+                        .expect("discover marker")
+                        .into_iter()
+                        .map(|sub_project| sub_project.language)
+                        .collect::<Vec<_>>(),
                     vec![indexer.language],
                     "marker {marker}"
                 );
@@ -1368,7 +2004,10 @@ exit 23
         fs::write(project.root.join("Cargo.toml"), "").expect("write Rust marker");
         fs::write(project.root.join("pubspec.yaml"), "").expect("write Dart marker");
 
-        let selection = select_languages(&project.root, None, None).expect("detect languages");
+        let discovered = discover_sub_projects(&project.root, DEFAULT_DISCOVER_DEPTH)
+            .expect("discover languages");
+        let selection = select_languages(discovered, None, None, DEFAULT_DISCOVER_DEPTH)
+            .expect("detect languages");
         assert_eq!(
             selection.languages,
             vec![Language::TypeScript, Language::Rust, Language::Dart]
@@ -1385,6 +2024,7 @@ exit 23
                 },
                 &[LanguageIndexResult {
                     language: Language::TypeScript,
+                    relative: PathBuf::new(),
                     documents: 1,
                 }],
                 &[],
@@ -1400,9 +2040,18 @@ exit 23
         let project = TestProject::new();
         fs::write(project.root.join("Cargo.toml"), "").expect("write Rust marker");
 
-        let selection =
-            select_languages(&project.root, Some("python"), None).expect("override language");
+        let discovered = discover_sub_projects(&project.root, DEFAULT_DISCOVER_DEPTH)
+            .expect("discover languages");
+        let selection = select_languages(discovered, Some("python"), None, DEFAULT_DISCOVER_DEPTH)
+            .expect("override language");
         assert_eq!(selection.languages, vec![Language::Python]);
+        assert_eq!(
+            selection.sub_projects,
+            vec![SubProject {
+                relative: PathBuf::new(),
+                language: Language::Python,
+            }]
+        );
         assert_eq!(selection.also_detected, vec![Language::Rust]);
         assert!(selection.requested_but_not_detected.is_empty());
     }
@@ -1418,8 +2067,11 @@ exit 23
             "rust".to_string(),
         ];
 
-        let selection = select_languages(&project.root, None, Some(&languages))
-            .expect("filter requested languages");
+        let discovered = discover_sub_projects(&project.root, DEFAULT_DISCOVER_DEPTH)
+            .expect("discover languages");
+        let selection =
+            select_languages(discovered, None, Some(&languages), DEFAULT_DISCOVER_DEPTH)
+                .expect("filter requested languages");
 
         assert_eq!(
             selection.languages,
@@ -1447,6 +2099,7 @@ exit 23
             &project.root,
             None,
             Some(&languages),
+            None,
             None,
             &mut IndexCache::default(),
             |language, _, output, _| {
@@ -1477,6 +2130,7 @@ exit 23
             None,
             Some(&languages),
             None,
+            None,
             &mut IndexCache::default(),
             |_, _, _, _| panic!("empty language intersection must not run an indexer"),
         )
@@ -1484,7 +2138,7 @@ exit 23
 
         assert_eq!(
             error.to_string(),
-            "project root has no marker file for any requested language: rust. A marker file must exist at the project root."
+            "no marker file for any requested language within 3 directory levels: rust"
         );
         assert!(!language_index_path(&project.root, Language::Rust).exists());
         assert!(!index_path(&project.root).exists());
@@ -1512,6 +2166,7 @@ exit 23
         let mut cache = IndexCache::default();
         let stats = run_indexer_with(
             &project.root,
+            None,
             None,
             None,
             None,
@@ -1561,6 +2216,7 @@ exit 23
             None,
             Some(&languages),
             None,
+            None,
             &mut IndexCache::default(),
             |language, _, output, _| {
                 assert_eq!(language, Language::Rust);
@@ -1593,6 +2249,7 @@ exit 23
             Some("rust"),
             Some(&languages),
             None,
+            None,
             &mut IndexCache::default(),
             |_, _, _, _| panic!("conflicting arguments must not run an indexer"),
         )
@@ -1609,6 +2266,7 @@ exit 23
             &project.root,
             None,
             Some(&languages),
+            None,
             None,
             &mut IndexCache::default(),
             |_, _, _, _| panic!("invalid arguments must not run an indexer"),
@@ -1637,6 +2295,7 @@ exit 23
 
         let stats = run_indexer_with(
             &project.root,
+            None,
             None,
             None,
             None,

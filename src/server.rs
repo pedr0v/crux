@@ -66,6 +66,8 @@ struct IndexArgs {
     languages: Option<Vec<String>>,
     #[serde(default)]
     max_file_mb: Option<u64>,
+    #[serde(default)]
+    discover_depth: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -340,6 +342,7 @@ impl Server {
                     arguments.language.as_deref(),
                     arguments.languages.as_deref(),
                     arguments.max_file_mb,
+                    arguments.discover_depth,
                     &mut self.cache,
                 )
             }),
@@ -560,6 +563,10 @@ fn slim_tool_definitions() -> Vec<Value> {
                     "max_file_mb": {
                         "type": "integer",
                         "description": "TypeScript MB limit."
+                    },
+                    "discover_depth": {
+                        "type": "integer",
+                        "description": "Max depth sub-project discovery. 0 = root only. Default 3."
                     }
                 }),
                 required_fields("scip_index")
@@ -1088,14 +1095,15 @@ mod tests {
         let result = server.call_tool(
             "scip_index",
             &json!({
-                "project_root": project.root
+                "project_root": project.root,
+                "discover_depth": 0
             }),
         );
 
         assert!(result.is_error);
         assert_eq!(
             result.text,
-            "could not auto-detect a supported language — add a project marker or pass language (typescript|python|rust|dart|java|cpp)"
+            "could not auto-detect a supported language within 0 directory levels — add a project marker, raise discover_depth, or pass language (typescript|python|rust|dart|java|cpp)"
         );
     }
 
@@ -1377,7 +1385,7 @@ mod tests {
             slim.len()
         );
         assert!(
-            full.len() <= 4_600,
+            full.len() <= 4_800,
             "full tools/list JSON is {} characters",
             full.len()
         );
