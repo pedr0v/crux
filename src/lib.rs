@@ -1,4 +1,7 @@
 mod index;
+mod prepare;
+mod prepare_java;
+mod prepare_languages;
 mod queries;
 mod render;
 mod semantic;

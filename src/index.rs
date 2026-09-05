@@ -20,6 +20,7 @@ enum Language {
     Dart,
     Java,
     Cpp,
+    Go,
 }
 
 const DEFAULT_DISCOVER_DEPTH: u32 = 3;
@@ -39,6 +40,7 @@ impl Language {
             Self::Dart => "dart",
             Self::Java => "java",
             Self::Cpp => "cpp",
+            Self::Go => "go",
         }
     }
 }
@@ -59,6 +61,12 @@ struct LanguageIndexer {
 }
 
 const LANGUAGE_INDEXERS: &[LanguageIndexer] = &[
+    LanguageIndexer {
+        language: Language::Go,
+        markers: &["go.mod", "go.work"],
+        command: go_indexer_command,
+        install_hint: "install Go to run the pinned scip-go indexer",
+    },
     LanguageIndexer {
         language: Language::TypeScript,
         markers: &["tsconfig.json", "jsconfig.json", "package.json"],
@@ -81,7 +89,7 @@ const LANGUAGE_INDEXERS: &[LanguageIndexer] = &[
         language: Language::Dart,
         markers: &["pubspec.yaml"],
         command: dart_indexer_command,
-        install_hint: "dart pub global activate scip_dart",
+        install_hint: "dart pub global activate scip_dart 1.6.2",
     },
     LanguageIndexer {
         language: Language::Java,
@@ -91,6 +99,11 @@ const LANGUAGE_INDEXERS: &[LanguageIndexer] = &[
             "build.gradle.kts",
             "settings.gradle",
             "settings.gradle.kts",
+            "WORKSPACE",
+            "WORKSPACE.bazel",
+            "MODULE.bazel",
+            "build.sbt",
+            "build.xml",
         ],
         command: java_indexer_command,
         install_hint: "install coursier (brew install coursier) — scip-java runs via cs launch",
@@ -99,7 +112,7 @@ const LANGUAGE_INDEXERS: &[LanguageIndexer] = &[
         language: Language::Cpp,
         markers: &["compile_commands.json", "build/compile_commands.json"],
         command: cpp_indexer_command,
-        install_hint: "download scip-clang from github.com/sourcegraph/scip-clang/releases",
+        install_hint: "download scip-clang v0.4.0 from github.com/sourcegraph/scip-clang/releases",
     },
 ];
 
@@ -174,7 +187,7 @@ fn load_index_file(path: &Path, metadata: &fs::Metadata) -> Result<LoadedIndex> 
     })
 }
 
-fn load_uncached_index(path: &Path) -> Result<LoadedIndex> {
+pub(crate) fn load_uncached_index(path: &Path) -> Result<LoadedIndex> {
     let metadata = fs::metadata(path).with_context(|| format!("read {}", path.display()))?;
     load_index_file(path, &metadata)
 }
@@ -349,7 +362,7 @@ fn typescript_indexer_command(
 ) -> IndexerCommand {
     let mut args = vec![
         "--yes".to_string(),
-        "@sourcegraph/scip-typescript".to_string(),
+        "@sourcegraph/scip-typescript@0.4.0".to_string(),
         "index".to_string(),
         "--output".to_string(),
         path_argument(output_path),
@@ -372,7 +385,7 @@ fn python_indexer_command(
         "npx".to_string(),
         vec![
             "--yes".to_string(),
-            "@sourcegraph/scip-python".to_string(),
+            "@sourcegraph/scip-python@0.6.6".to_string(),
             "index".to_string(),
             ".".to_string(),
             "--output".to_string(),
@@ -425,7 +438,9 @@ fn java_indexer_command(
         "cs".to_string(),
         vec![
             "launch".to_string(),
-            "com.sourcegraph:scip-java_2.13:latest.stable".to_string(),
+            "org.scip-code:scip-java:0.13.1".to_string(),
+            "-M".to_string(),
+            "org.scip_code.scip_java.ScipJava".to_string(),
             "--".to_string(),
             "index".to_string(),
             "--output".to_string(),
@@ -481,8 +496,9 @@ fn parse_language(language: &str) -> Result<Language> {
         "dart" => Ok(Language::Dart),
         "java" => Ok(Language::Java),
         "cpp" => Ok(Language::Cpp),
+        "go" => Ok(Language::Go),
         _ => bail!(
-            "unsupported language: {language} (expected typescript|python|rust|dart|java|cpp)"
+            "unsupported language: {language} (expected typescript|python|rust|dart|java|cpp|go)"
         ),
     }
 }
@@ -687,7 +703,7 @@ fn select_languages(
 
     if detected.is_empty() {
         bail!(
-            "could not auto-detect a supported language within {discover_depth} directory levels — add a project marker, raise discover_depth, or pass language (typescript|python|rust|dart|java|cpp)"
+            "could not auto-detect a supported language within {discover_depth} directory levels — add a project marker, raise discover_depth, or pass language (typescript|python|rust|dart|java|cpp|go)"
         );
     }
 
@@ -1179,7 +1195,16 @@ pub(crate) fn run_indexer(
         max_file_mb,
         discover_depth,
         cache,
-        indexer_command,
+        |language, repo, output, max_file_mb| {
+            if matches!(
+                language,
+                Language::Java | Language::Go | Language::TypeScript
+            ) {
+                adapter_command(language, repo, output, max_file_mb)
+            } else {
+                indexer_command(language, repo, output, max_file_mb)
+            }
+        },
     )
 }
 
@@ -1263,6 +1288,54 @@ where
         stats.push_str(&notice);
     }
     Ok(stats)
+}
+
+fn adapter_command(
+    language: Language,
+    repo: &Path,
+    output: &Path,
+    max_file_mb: Option<u64>,
+) -> IndexerCommand {
+    let mut args = vec![
+        "__index-adapter".into(),
+        language.as_str().into(),
+        path_argument(repo),
+        path_argument(output),
+    ];
+    if let Some(limit) = max_file_mb {
+        args.push(limit.to_string());
+    }
+    (
+        std::env::current_exe()
+            .expect("current executable")
+            .to_string_lossy()
+            .into_owned(),
+        args,
+    )
+}
+
+fn go_indexer_command(repo: &Path, output: &Path, _max_file_mb: Option<u64>) -> IndexerCommand {
+    adapter_command(Language::Go, repo, output, None)
+}
+
+pub(crate) fn preparation_projects(repo: &Path, depth: u32) -> Result<Vec<(String, PathBuf)>> {
+    Ok(discover_sub_projects(repo, depth)?
+        .into_iter()
+        .map(|project| (project.language.as_str().to_owned(), project.relative))
+        .collect())
+}
+
+pub(crate) fn preparation_command(
+    language: &str,
+    repo: &Path,
+    output: &Path,
+) -> Result<IndexerCommand> {
+    Ok(indexer_command(
+        parse_language(language)?,
+        repo,
+        output,
+        None,
+    ))
 }
 
 #[cfg(test)]
@@ -1432,7 +1505,7 @@ mod tests {
             args,
             vec![
                 "--yes",
-                "@sourcegraph/scip-typescript",
+                "@sourcegraph/scip-typescript@0.4.0",
                 "index",
                 "--output",
                 &path_argument(&output_path),
@@ -1453,7 +1526,7 @@ mod tests {
             args,
             vec![
                 "--yes",
-                "@sourcegraph/scip-python",
+                "@sourcegraph/scip-python@0.6.6",
                 "index",
                 ".",
                 "--output",
@@ -1507,7 +1580,9 @@ mod tests {
             args,
             vec![
                 "launch",
-                "com.sourcegraph:scip-java_2.13:latest.stable",
+                "org.scip-code:scip-java:0.13.1",
+                "-M",
+                "org.scip_code.scip_java.ScipJava",
                 "--",
                 "index",
                 "--output",
@@ -2275,7 +2350,7 @@ exit 23
 
         assert_eq!(
             error.to_string(),
-            "unsupported language: notalanguage (expected typescript|python|rust|dart|java|cpp)"
+            "unsupported language: notalanguage (expected typescript|python|rust|dart|java|cpp|go)"
         );
     }
 
@@ -2345,7 +2420,7 @@ exit 23
 
         assert_eq!(
             error.to_string(),
-            "indexer for cpp not found — download scip-clang from github.com/sourcegraph/scip-clang/releases"
+            "indexer for cpp not found — download scip-clang v0.4.0 from github.com/sourcegraph/scip-clang/releases"
         );
     }
 
