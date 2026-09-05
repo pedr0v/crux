@@ -30,7 +30,7 @@ pub(crate) const DEFAULT_DEAD_LIMIT: usize = 100;
 const DEFAULT_OUTLINE_LIMIT: usize = 38;
 pub(crate) const MAX_LIMIT: usize = 200;
 const MAX_CALLER_DEPTH: usize = 3;
-const HELP_TEXT: &str = "Usage:\n  crux [--profile slim|full]\n  crux [--profile slim|full] --version\n  crux self-update [--check]\n  crux check <absolute-project-root>\n  crux setup <codex|claude> [--project <dir>]\n  crux unsetup <codex|claude> [--project <dir>]";
+const HELP_TEXT: &str = "Usage:\n  crux prepare --repo <dir> --output <external-index> [--format json]\n  crux census --repo <dir> [--format json]\n  crux capabilities\n  crux check --index <file>\n  crux [--profile slim|full]\n  crux [--profile slim|full] --version\n  crux self-update [--check]\n  crux check <absolute-project-root>\n  crux setup <codex|claude> [--project <dir>]\n  crux unsetup <codex|claude> [--project <dir>]";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Profile {
@@ -867,9 +867,38 @@ fn resolve_profile(
 
 pub fn run() -> Result<()> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    // Preparation is a standalone gate and must report JSON even when an MCP
+    // profile setting is invalid in the caller's environment.
+    if arguments
+        .first()
+        .is_some_and(|command| command == "prepare")
+    {
+        return crate::prepare::run(&arguments[1..]);
+    }
     let environment_profile = env::var("CRUX_PROFILE").ok();
     let (profile, arguments) = resolve_profile(arguments, environment_profile.as_deref())?;
     match arguments.as_slice() {
+        [command, arguments @ ..] if command == "prepare" => crate::prepare::run(arguments),
+        [command, arguments @ ..] if command == "census" => crate::prepare::census(arguments),
+        [command] if command == "capabilities" => {
+            println!("{}", crate::prepare::capabilities());
+            Ok(())
+        }
+        [command, language, repo, output] if command == "__index-adapter" => {
+            crate::prepare::index_adapter(language, Path::new(repo), Path::new(output), None)
+        }
+        [command, language, repo, output, limit] if command == "__index-adapter" => {
+            crate::prepare::index_adapter(
+                language,
+                Path::new(repo),
+                Path::new(output),
+                Some(limit.parse()?),
+            )
+        }
+        [command, flag, path] if command == "check" && flag == "--index" => {
+            println!("{}", crate::prepare::validate(Path::new(path), 1)?);
+            Ok(())
+        }
         [] => run_stdio(profile),
         [flag] if flag == "--help" || flag == "-h" => {
             println!("{HELP_TEXT}");
@@ -1103,7 +1132,7 @@ mod tests {
         assert!(result.is_error);
         assert_eq!(
             result.text,
-            "could not auto-detect a supported language within 0 directory levels — add a project marker, raise discover_depth, or pass language (typescript|python|rust|dart|java|cpp)"
+            "could not auto-detect a supported language within 0 directory levels — add a project marker, raise discover_depth, or pass language (typescript|python|rust|dart|java|cpp|go)"
         );
     }
 

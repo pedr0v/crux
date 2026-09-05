@@ -176,12 +176,13 @@ The unreferenced query has no path or export filter.
 
 | Language | Indexer | Requirement |
 | --- | --- | --- |
-| TypeScript / JavaScript | `scip-typescript` through `npx` | Install Node.js. |
-| Python | `scip-python` through `npx` | Install Node.js version 22 or lower. For large vendored directories, add an exclude list to `pyrightconfig.json`. |
+| TypeScript / JavaScript | `scip-typescript` 0.4.0 through `npx` | Install Node.js. |
+| Python | `scip-python` 0.6.6 through `npx` | Install Node.js version 22 or lower. For large vendored directories, add an exclude list to `pyrightconfig.json`. |
+| Go | `scip-go` 0.2.7 | Install Go 1.25 or newer. Crux supports modules, workspaces, and vendored dependencies. |
 | Rust | `rust-analyzer scip` | Run `rustup component add rust-analyzer`. |
-| Dart / Flutter | `scip_dart` | Run `dart pub global activate scip_dart`. |
-| Java / Kotlin | `scip-java` | Install [Coursier](https://get-coursier.io/). |
-| C / C++ | `scip-clang` | Supply a `compile_commands.json` compilation database. |
+| Dart / Flutter | `scip_dart` | Run `dart pub global activate scip_dart 1.6.2`. |
+| Java / Kotlin | `scip-java` 0.13.1 | Install [Coursier](https://get-coursier.io/). |
+| C / C++ | `scip-clang` 0.4.0 | Supply a `compile_commands.json` compilation database. |
 
 Crux searches for language markers three directory levels below the project root.
 It runs each indexer from the sub-project that owns the marker.
@@ -191,6 +192,77 @@ A directory that owns a language hides markers for the same language below it.
 Crux skips hidden directories, `node_modules`, `target`, `dist`, `build`, `out`, `vendor`, `venv`, and `__pycache__`.
 
 crux writes the index to `<project>/.scip-nav/index.scip`. Add `.scip-nav/` to your global gitignore file.
+
+### Prepare an index before an agent starts
+
+```sh
+crux capabilities
+crux census --repo /workspace --format json
+crux prepare --repo /workspace --output /cache/index.scip --format json
+crux check --index /cache/index.scip
+```
+
+`prepare` requires a clean Git checkout and an output path outside that checkout.
+It writes one JSON result to stdout and sends diagnostics to stderr.
+A successful result has `status: "ready"`, `model_ready: true`, and `validation.passed: true`.
+Failures return a nonzero exit code and a structured `error_code`.
+Crux never starts a model. The caller must require preparation success before starting its agent.
+
+```sh
+if crux prepare --repo /workspace --output /cache/index.scip --format json > /cache/prepare.json; then
+  mkdir -p /workspace/.scip-nav
+  cp /cache/index.scip /workspace/.scip-nav/index.scip
+  # Start the agent here.
+fi
+```
+
+The caller installs the validated index in `.scip-nav` for MCP queries.
+Add `.scip-nav/` to the checkout's ignore rules before preparation.
+The `check --index` command rejects malformed indexes and indexes without documents or symbols.
+
+Preparation supports `--language`, `--discover-depth` (default 3), and `--min-index-bytes` (default 100).
+Crux validates every selected index before it publishes the merged index.
+The result reports detected languages, build tools, revision, index size, SHA-256, tool versions, and cache status.
+It also reports skipped included builds and inferred configurations.
+
+Cache provenance includes the repository identity, absolute path, revision, submodule revisions, platform, Crux version, and preparation strategy.
+It also includes indexer arguments, indexer versions, runtime versions, and hashes of relevant environment settings.
+Crux validates the index hash and contents on every cache hit.
+A repository change, toolchain change, or strategy change prevents reuse.
+Crux locks each output during preparation and replaces validated files atomically.
+A missing or mismatched provenance file prevents reuse after an interrupted publication.
+
+The Java adapter uses `org.scip-code:scip-java:0.13.1` and requires JDK 17 or newer.
+Its Gradle strategy filters the plugin to the primary build and reports actual skipped included builds.
+The TypeScript adapter discovers nested `tsconfig.json` and `jsconfig.json` files.
+When no config exists, it writes an inferred config outside the checkout and records its contents in provenance.
+Go preparation builds the pinned indexer outside the checkout and excludes generated and vendored documents from navigation.
+
+Preparation keeps its temporary files outside the source tree.
+Build tools can still create their normal build outputs.
+Maven and Gradle use separate arguments.
+Unsupported Java build systems return `unsupported_build` before indexing.
+Callers can use text search after `unsupported_language` or `unsupported_build` instead of retrying preparation.
+Other errors include `included_build_incompatible`, `typescript_config_missing`, `dirty_repository`, and `invalid_index`.
+
+
+## Validation
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+```
+
+Real indexer fixtures are separate because they download tools and build dependencies.
+With Go 1.25+, Node.js/npx, JDK 17+, Coursier (`cs`), Maven, and Gradle on `PATH`, run:
+
+```sh
+cargo test --locked --lib -- --ignored
+```
+
+These fixtures cover Maven with Apache RAT, Gradle included-build filtering, a Go workspace, and nested/inferred TypeScript configs.
+The CLI suite also checks cache reuse, revision and toolchain invalidation, failed preparation, and the model-start gate.
 
 ## Benchmark
 
