@@ -23,11 +23,11 @@ jobs:
             binary: crux
             asset: crux-x86_64-apple-darwin
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             binary: crux
             asset: crux-x86_64-unknown-linux-gnu
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             binary: crux
             asset: crux-aarch64-unknown-linux-gnu
           - target: x86_64-pc-windows-msvc
@@ -42,11 +42,30 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Install Linux ARM64 cross-compiler
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify binary runs on the supported platform
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          BINARY: ${{ matrix.binary }}
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/$BINARY"
+          if [[ "$TARGET" == "aarch64-unknown-linux-gnu" ]]; then
+            actual="$(qemu-aarch64 -L /usr/aarch64-linux-gnu "$binary" --version)"
+          else
+            actual="$("$binary" --version)"
+          fi
+          expected="crux ${GITHUB_REF_NAME#v}"
+          [[ "$actual" == "$expected" ]] || {
+            echo "Expected $expected, got $actual"
+            exit 1
+          }
+          echo "$actual runs successfully on $TARGET"
       - name: Stage binary
         shell: bash
         run: |
