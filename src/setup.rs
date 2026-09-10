@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 
 const BEGIN_MARKER: &str = "# --- crux begin ---";
 const END_MARKER: &str = "# --- crux end ---";
-const ADOPTION_BODY: &str = "## crux code index\n\nThis project may have a crux code index.\n\nWho calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely.\n\nPlain text search is cheaper for a simple 'where is X defined' question.";
+const ADOPTION_BODY: &str = "## crux code index\n\nThis project may have a crux code index.\n\nStart with one precise Crux query for references, callers, change impact, or dead code. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query.";
 const CODEX_REQUIRED_KEYS: [(&str, &str); 3] = [
     ("required", "required = true"),
     ("startup_timeout_sec", "startup_timeout_sec = 30"),
@@ -593,6 +593,14 @@ fn shell_quote(path: &Path) -> String {
 mod tests {
     use super::*;
     use crate::test_support::TestProject;
+
+    #[test]
+    fn adoption_guidance_routes_queries_and_stops_empty_retries() {
+        assert!(ADOPTION_BODY.contains("one precise Crux query for references, callers"));
+        assert!(ADOPTION_BODY.contains("Prefer rg for simple text searches or definition lookup"));
+        assert!(ADOPTION_BODY.contains("If Crux returns no relevant match, switch to rg"));
+        assert!(ADOPTION_BODY.contains("Do not repeat the same or an equivalent empty Crux query"));
+    }
 
     #[test]
     fn marker_insert_and_remove_round_trip_lf_bytes() {

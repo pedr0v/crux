@@ -14,8 +14,8 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
-const FULL_INSTRUCTIONS: &str = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely. Use scip_map directly with the symbol name; it resolves or lists candidates. Use scip_find for fragments, browsing, and unreferenced audits. Plain text search is cheaper for a simple 'where is X defined' question. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
-const SLIM_INSTRUCTIONS: &str = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely. Use scip_map directly with the symbol name; it resolves or lists candidates. Use scip_find for fragments, browsing, and unreferenced audits. Plain text search is cheaper for a simple 'where is X defined' question. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
+const FULL_INSTRUCTIONS: &str = "Start with one precise Crux query for references, callers, change impact, or dead code. Use scip_map with an exact symbol name when possible; it resolves or lists candidates. Use scip_find for fragments, browsing, or unreferenced audits. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
+const SLIM_INSTRUCTIONS: &str = "Start with one precise Crux query for references, callers, change impact, or dead code. Use scip_map with an exact symbol name when possible; it resolves or lists candidates. Use scip_find for fragments, browsing, or unreferenced audits. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
 const EXPANDED_TOOLS: &str = "expanded: scip_search, scip_def, scip_refs, scip_callers, scip_dead";
 const DEFAULT_FIND_LIMIT: usize = 20;
 const DEFAULT_MAP_REF_LIMIT: usize = 20;
@@ -1367,7 +1367,8 @@ mod tests {
 
     #[test]
     fn initialize_response_uses_profile_instructions() {
-        let required_lead = "Who calls X? What references X? What breaks if X changes? Is X dead code? — the index answers each in ONE call; grep answers them incompletely.";
+        let required_lead =
+            "Start with one precise Crux query for references, callers, change impact, or dead code.";
         for (profile, expansion_hint) in [(Profile::Slim, true), (Profile::Full, false)] {
             let mut server = Server::new(profile);
             let response = server
@@ -1389,10 +1390,15 @@ mod tests {
 
             assert!(instructions.starts_with(required_lead));
             assert!(instructions.split_whitespace().count() < 120);
-            assert!(instructions.contains("Use scip_map directly with the symbol name"));
-            assert!(instructions
-                .contains("Use scip_find for fragments, browsing, and unreferenced audits"));
-            assert!(instructions.contains("Plain text search is cheaper"));
+            assert!(instructions.contains("Use scip_map with an exact symbol name"));
+            assert!(instructions.contains("Use scip_find for fragments"));
+            assert!(
+                instructions.contains("Prefer rg for simple text searches or definition lookup")
+            );
+            assert!(instructions.contains("If Crux returns no relevant match, switch to rg"));
+            assert!(
+                instructions.contains("Do not repeat the same or an equivalent empty Crux query")
+            );
             assert!(instructions.contains("at most two index calls before answering"));
             assert_eq!(instructions.contains("Call scip_expand"), expansion_hint);
             assert_eq!(
