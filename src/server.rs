@@ -14,8 +14,8 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
-const FULL_INSTRUCTIONS: &str = "Start with one precise Crux query for references, callers, change impact, or dead code. Use scip_map with an exact symbol name when possible; it resolves or lists candidates. Use scip_find for fragments, browsing, or unreferenced audits. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
-const SLIM_INSTRUCTIONS: &str = "Start with one precise Crux query for references, callers, change impact, or dead code. Use scip_map with an exact symbol name when possible; it resolves or lists candidates. Use scip_find for fragments, browsing, or unreferenced audits. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
+const FULL_INSTRUCTIONS: &str = "Start with one precise Crux query for references, callers, change impact, or dead code. Use scip_map with an exact symbol name when possible; it resolves or lists candidates. Answer caller or file questions from the scip_map callers: and files: lines. If a scip_map section is truncated, call scip_map once more with ref_limit=200, not small offsets. Use scip_find for fragments, browsing, or unreferenced audits. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
+const SLIM_INSTRUCTIONS: &str = "Start with one precise Crux query for references, callers, change impact, or dead code. Use scip_map with an exact symbol name when possible; it resolves or lists candidates. Answer caller or file questions from the scip_map callers: and files: lines. If a scip_map section is truncated, call scip_map once more with ref_limit=200, not small offsets. Use scip_find for fragments, browsing, or unreferenced audits. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
 const EXPANDED_TOOLS: &str = "expanded: scip_search, scip_def, scip_refs, scip_callers, scip_dead";
 const DEFAULT_FIND_LIMIT: usize = 20;
 const DEFAULT_MAP_REF_LIMIT: usize = 20;
@@ -1391,6 +1391,8 @@ mod tests {
             assert!(instructions.starts_with(required_lead));
             assert!(instructions.split_whitespace().count() < 120);
             assert!(instructions.contains("Use scip_map with an exact symbol name"));
+            assert!(instructions.contains("from the scip_map callers: and files: lines"));
+            assert!(instructions.contains("call scip_map once more with ref_limit=200"));
             assert!(instructions.contains("Use scip_find for fragments"));
             assert!(
                 instructions.contains("Prefer rg for simple text searches or definition lookup")

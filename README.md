@@ -142,6 +142,8 @@ You can also set `CRUX_PROFILE=full`. The `--profile` flag overrides the environ
 | `scip_outline` | Shows the definition structure of one file. |
 | `scip_expand` | Adds the narrow tools to a slim server session. |
 
+`scip_map` shows 20 references and 20 callers per symbol by default. When a section is complete, `scip_map` adds a `callers:` or `files:` summary line. When a section is truncated, `scip_map` shows `… N more (pass offset=K)` and no summary line. The server instructions tell the agent to call `scip_map` once more with `ref_limit=200`. The maximum `ref_limit` is 200.
+
 The `full` profile and `scip_expand` add these narrow tools:
 
 | Tool | Function |
