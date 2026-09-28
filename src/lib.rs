@@ -1,3 +1,4 @@
+mod architecture;
 mod index;
 mod prepare;
 mod prepare_java;

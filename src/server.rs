@@ -1,21 +1,25 @@
+use crate::architecture::{ArchitectureDirection, ArchitectureProjection, ArchitectureQuery};
 use crate::index::{run_indexer, IndexCache, IndexStats};
 use crate::queries::{
     callers, dead_exports, definitions, find, map_symbols, outline, references, search,
     MAX_MAP_NAMES,
 };
+use crate::semantic::SemanticIndex;
 use crate::setup;
 use crate::update;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::env;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
-const FULL_INSTRUCTIONS: &str = "Start with one precise Crux query for references, callers, change impact, or dead code. Use scip_map with an exact symbol name when possible; it resolves or lists candidates. Answer caller or file questions from the scip_map callers: and files: lines. If a scip_map section is truncated, call scip_map once more with ref_limit=200, not small offsets. Use scip_find for fragments, browsing, or unreferenced audits. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
-const SLIM_INSTRUCTIONS: &str = "Start with one precise Crux query for references, callers, change impact, or dead code. Use scip_map with an exact symbol name when possible; it resolves or lists candidates. Answer caller or file questions from the scip_map callers: and files: lines. If a scip_map section is truncated, call scip_map once more with ref_limit=200, not small offsets. Use scip_find for fragments, browsing, or unreferenced audits. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
+const FULL_INSTRUCTIONS: &str = "Use scip_architecture once for explicit architecture questions, module or package dependencies, cycles, or unclear scope before a change across files. Pass a known project-relative file or directory as scope. Reuse relevant architecture results until the index changes. Use scip_map for named-symbol references and callers. Use scip_outline for one file's symbols. Use scip_find for fragments or unreferenced audits. Prefer rg for simple text or definition search. Do not require architecture before every edit or symbol query. If a Crux result is empty, use repository-native search and stop equivalent retries. If a scip_map section is truncated, call it once more with ref_limit=200. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
+const SLIM_INSTRUCTIONS: &str = "Use scip_architecture once for explicit architecture questions, module or package dependencies, cycles, or unclear scope before a change across files. Pass a known project-relative file or directory as scope. Reuse relevant architecture results until the index changes. Use scip_map for named-symbol references and callers. Use scip_outline for one file's symbols. Use scip_find for fragments or unreferenced audits. Prefer rg for simple text or definition search. Do not require architecture before every edit or symbol query. If a Crux result is empty, use repository-native search and stop equivalent retries. If a scip_map section is truncated, call it once more with ref_limit=200. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
 const EXPANDED_TOOLS: &str = "expanded: scip_search, scip_def, scip_refs, scip_callers, scip_dead";
 const DEFAULT_FIND_LIMIT: usize = 20;
 const DEFAULT_MAP_REF_LIMIT: usize = 20;
@@ -28,9 +32,10 @@ pub(crate) const DEFAULT_MAP_REFS_LIMIT: usize = 20;
 pub(crate) const DEFAULT_CALLERS_LIMIT: usize = 40;
 pub(crate) const DEFAULT_DEAD_LIMIT: usize = 100;
 const DEFAULT_OUTLINE_LIMIT: usize = 38;
+const DEFAULT_ARCHITECTURE_LIMIT: usize = 20;
 pub(crate) const MAX_LIMIT: usize = 200;
 const MAX_CALLER_DEPTH: usize = 3;
-const HELP_TEXT: &str = "Usage:\n  crux prepare --repo <dir> --output <external-index> [--format json]\n  crux census --repo <dir> [--format json]\n  crux capabilities\n  crux check --index <file>\n  crux [--profile slim|full]\n  crux [--profile slim|full] --version\n  crux self-update [--check]\n  crux check <absolute-project-root>\n  crux setup <codex|claude> [--project <dir>]\n  crux unsetup <codex|claude> [--project <dir>]";
+const HELP_TEXT: &str = "Usage:\n  crux architecture [project-dir] [--index <file>] [--output <directory>]\n  crux prepare --repo <dir> --output <external-index> [--format json]\n  crux census --repo <dir> [--format json]\n  crux capabilities\n  crux check --index <file>\n  crux [--profile slim|full]\n  crux [--profile slim|full] --version\n  crux self-update [--check]\n  crux check <absolute-project-root>\n  crux setup <codex|claude> [--project <dir>]\n  crux unsetup <codex|claude> [--project <dir>]";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum Profile {
@@ -155,6 +160,20 @@ struct OutlineArgs {
     offset: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArchitectureToolArgs {
+    project_root: String,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    direction: ArchitectureDirection,
+    #[serde(default = "default_architecture_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
 fn default_find_limit() -> usize {
     DEFAULT_FIND_LIMIT
 }
@@ -187,6 +206,10 @@ fn default_outline_limit() -> usize {
     DEFAULT_OUTLINE_LIMIT
 }
 
+fn default_architecture_limit() -> usize {
+    DEFAULT_ARCHITECTURE_LIMIT
+}
+
 fn default_true() -> bool {
     true
 }
@@ -197,7 +220,7 @@ fn bounded_limit(limit: usize) -> usize {
 
 fn required_fields(tool_name: &str) -> &'static [&'static str] {
     match tool_name {
-        "scip_index" | "scip_dead" => &["project_root"],
+        "scip_index" | "scip_dead" | "scip_architecture" => &["project_root"],
         "scip_find" | "scip_def" | "scip_refs" | "scip_callers" => &["project_root", "name"],
         "scip_search" => &["project_root", "query"],
         "scip_map" => &["project_root", "names"],
@@ -247,10 +270,18 @@ impl ToolResult {
 
 struct Server {
     cache: IndexCache,
+    architecture_cache: HashMap<PathBuf, CachedArchitecture>,
     profile: Profile,
     expanded: bool,
     list_changed_pending: bool,
     savings_ledger: Option<SavingsLedger>,
+    #[cfg(test)]
+    architecture_build_count: usize,
+}
+
+struct CachedArchitecture {
+    index: Arc<SemanticIndex>,
+    projection: ArchitectureProjection,
 }
 
 /// The ledger appends one JSON line per successful tool call.
@@ -318,10 +349,13 @@ impl Server {
     fn new(profile: Profile) -> Self {
         Self {
             cache: IndexCache::default(),
+            architecture_cache: HashMap::new(),
             profile,
             expanded: profile == Profile::Full,
             list_changed_pending: false,
             savings_ledger: SavingsLedger::from_environment(),
+            #[cfg(test)]
+            architecture_build_count: 0,
         }
     }
 
@@ -337,15 +371,52 @@ impl Server {
     fn call_tool(&mut self, name: &str, arguments: &Value) -> ToolResult {
         let result = match name {
             "scip_index" => parse_arguments::<IndexArgs>(name, arguments).and_then(|arguments| {
-                run_indexer(
-                    Path::new(&arguments.project_root),
+                let project_root = Path::new(&arguments.project_root);
+                let result = run_indexer(
+                    project_root,
                     arguments.language.as_deref(),
                     arguments.languages.as_deref(),
                     arguments.max_file_mb,
                     arguments.discover_depth,
                     &mut self.cache,
-                )
+                );
+                if result.is_ok() {
+                    self.architecture_cache.remove(project_root);
+                }
+                result
             }),
+            "scip_architecture" => parse_arguments::<ArchitectureToolArgs>(name, arguments)
+                .and_then(|arguments| {
+                    let project_root = PathBuf::from(&arguments.project_root);
+                    let loaded = self.cache.load(&project_root)?;
+                    let needs_projection = self
+                        .architecture_cache
+                        .get(&project_root)
+                        .is_none_or(|cached| !Arc::ptr_eq(&cached.index, &loaded.index));
+                    if needs_projection {
+                        self.architecture_cache.insert(
+                            project_root.clone(),
+                            CachedArchitecture {
+                                index: Arc::clone(&loaded.index),
+                                projection: ArchitectureProjection::new(&loaded.index),
+                            },
+                        );
+                        #[cfg(test)]
+                        {
+                            self.architecture_build_count += 1;
+                        }
+                    }
+                    self.architecture_cache
+                        .get(&project_root)
+                        .expect("architecture projection exists")
+                        .projection
+                        .query(ArchitectureQuery {
+                            scope: arguments.scope.as_deref(),
+                            direction: arguments.direction,
+                            limit: bounded_limit(arguments.limit),
+                            offset: arguments.offset,
+                        })
+                }),
             "scip_find" => parse_arguments::<FindArgs>(name, arguments).and_then(|arguments| {
                 let loaded = self.cache.load(Path::new(&arguments.project_root))?;
                 find(
@@ -492,7 +563,7 @@ impl Server {
                 let result = self.call_tool(name, &arguments);
                 // scip_index is a build step, not an answer; recording it
                 // would book savings for work the agent never avoided.
-                if !result.is_error && name != "scip_index" {
+                if !result.is_error && savings_eligible(name) {
                     if let Some(ledger) = &self.savings_ledger {
                         ledger.record(name, &result.text);
                     }
@@ -513,6 +584,10 @@ impl Server {
         }
         messages
     }
+}
+
+fn savings_eligible(tool: &str) -> bool {
+    !matches!(tool, "scip_index" | "scip_architecture")
 }
 
 fn rpc_success(id: Value, result: Value) -> String {
@@ -573,6 +648,41 @@ fn slim_tool_definitions() -> Vec<Value> {
             )
         }),
         json!({
+            "name": "scip_architecture",
+            "description": "Shows SCIP-derived module and package architecture. Use once for explicit architecture, dependency, cycle, or unclear multi-file scope questions. Pass a known project-relative scope. Do not use for named symbols or simple text search.",
+            "inputSchema": object_schema(
+                json!({
+                    "project_root": {
+                        "type": "string",
+                        "description": "Absolute root."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "description": "Optional project-relative file or directory."
+                    },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["incoming", "outgoing", "both"],
+                        "default": "both",
+                        "description": "Dependency direction for a scoped query."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": DEFAULT_ARCHITECTURE_LIMIT,
+                        "minimum": 1,
+                        "maximum": MAX_LIMIT,
+                        "description": "Per-section result limit."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Per-section result offset."
+                    }
+                }),
+                required_fields("scip_architecture")
+            )
+        }),
+        json!({
             "name": "scip_find",
             "description": "Answers 'which symbol matches this name or fragment?' — use to find or disambiguate symbols; set unreferenced=true to list dead symbols.",
             "inputSchema": object_schema(
@@ -603,7 +713,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_map",
-            "description": "Answers 'who calls X?', 'what references X?', and 'where is X defined?' completely in ONE call — use before any text search for symbol questions.",
+            "description": "Answers named-symbol reference and caller questions in one call. It also reports definitions. Use rg for simple text or definition-only search.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -867,17 +977,25 @@ fn resolve_profile(
 
 pub fn run() -> Result<()> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    // Preparation is a standalone gate and must report JSON even when an MCP
-    // profile setting is invalid in the caller's environment.
+    // Standalone commands do not use the MCP profile setting.
     if arguments
         .first()
         .is_some_and(|command| command == "prepare")
     {
         return crate::prepare::run(&arguments[1..]);
     }
+    if arguments
+        .first()
+        .is_some_and(|command| command == "architecture")
+    {
+        return crate::architecture::run(&arguments[1..]);
+    }
     let environment_profile = env::var("CRUX_PROFILE").ok();
     let (profile, arguments) = resolve_profile(arguments, environment_profile.as_deref())?;
     match arguments.as_slice() {
+        [command, arguments @ ..] if command == "architecture" => {
+            crate::architecture::run(arguments)
+        }
         [command, arguments @ ..] if command == "prepare" => crate::prepare::run(arguments),
         [command, arguments @ ..] if command == "census" => crate::prepare::census(arguments),
         [command] if command == "capabilities" => {
@@ -966,6 +1084,9 @@ mod tests {
         assert_eq!(lines[0]["response_tokens"], 100);
         assert_eq!(lines[0]["saved_tokens"], 80);
         assert_eq!(lines[1]["saved_tokens"], 8);
+        assert!(savings_eligible("scip_map"));
+        assert!(!savings_eligible("scip_index"));
+        assert!(!savings_eligible("scip_architecture"));
     }
 
     #[test]
@@ -975,6 +1096,7 @@ mod tests {
         let expected =
             "index is empty (0 documents) — likely a crashed indexer; run scip_index to rebuild";
         let cases = vec![
+            ("scip_architecture", json!({"project_root": &project.root})),
             (
                 "scip_map",
                 json!({"project_root": &project.root, "names": ["missing"]}),
@@ -1051,6 +1173,25 @@ mod tests {
                 .unwrap_or_default();
 
             assert_eq!(schema_required, required_fields(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn architecture_tool_is_in_slim_and_full_profiles() {
+        for expanded in [false, true] {
+            let tools = tool_definitions(expanded);
+            let architecture = tools
+                .iter()
+                .find(|tool| tool["name"] == "scip_architecture")
+                .expect("architecture tool");
+            assert_eq!(
+                architecture.pointer("/inputSchema/required/0"),
+                Some(&json!("project_root"))
+            );
+            assert_eq!(
+                architecture.pointer("/inputSchema/properties/direction/default"),
+                Some(&json!("both"))
+            );
         }
     }
 
@@ -1333,7 +1474,7 @@ mod tests {
             .pointer("/result/tools")
             .and_then(Value::as_array)
             .expect("tools array");
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         assert_eq!(
             tools
                 .iter()
@@ -1341,6 +1482,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "scip_index",
+                "scip_architecture",
                 "scip_find",
                 "scip_map",
                 "scip_outline",
@@ -1367,8 +1509,7 @@ mod tests {
 
     #[test]
     fn initialize_response_uses_profile_instructions() {
-        let required_lead =
-            "Start with one precise Crux query for references, callers, change impact, or dead code.";
+        let required_lead = "Use scip_architecture once for explicit architecture questions";
         for (profile, expansion_hint) in [(Profile::Slim, true), (Profile::Full, false)] {
             let mut server = Server::new(profile);
             let response = server
@@ -1389,18 +1530,16 @@ mod tests {
                 .expect("instructions string");
 
             assert!(instructions.starts_with(required_lead));
-            assert!(instructions.split_whitespace().count() < 120);
-            assert!(instructions.contains("Use scip_map with an exact symbol name"));
-            assert!(instructions.contains("from the scip_map callers: and files: lines"));
-            assert!(instructions.contains("call scip_map once more with ref_limit=200"));
+            assert!(instructions.split_whitespace().count() < 135);
+            assert!(instructions.contains("Pass a known project-relative file or directory"));
+            assert!(instructions.contains("Reuse relevant architecture results"));
+            assert!(instructions.contains("Use scip_map for named-symbol references and callers"));
+            assert!(instructions.contains("Use scip_outline for one file's symbols"));
+            assert!(instructions.contains("call it once more with ref_limit=200"));
             assert!(instructions.contains("Use scip_find for fragments"));
-            assert!(
-                instructions.contains("Prefer rg for simple text searches or definition lookup")
-            );
-            assert!(instructions.contains("If Crux returns no relevant match, switch to rg"));
-            assert!(
-                instructions.contains("Do not repeat the same or an equivalent empty Crux query")
-            );
+            assert!(instructions.contains("Prefer rg for simple text or definition search"));
+            assert!(instructions.contains("Do not require architecture before every edit"));
+            assert!(instructions.contains("stop equivalent retries"));
             assert!(instructions.contains("at most two index calls before answering"));
             assert_eq!(instructions.contains("Call scip_expand"), expansion_hint);
             assert_eq!(
@@ -1415,14 +1554,14 @@ mod tests {
         let slim = rpc_success(json!(1), json!({"tools": tool_definitions(false)}));
         let full = rpc_success(json!(1), json!({"tools": tool_definitions(true)}));
 
-        // Trigger-worded SLIM descriptions spend more of both budgets to improve organic adoption.
+        // The compact schemas keep the persistent tool list small.
         assert!(
-            slim.len() <= 2_600,
+            slim.len() <= 3_500,
             "slim tools/list JSON is {} characters",
             slim.len()
         );
         assert!(
-            full.len() <= 4_800,
+            full.len() <= 5_700,
             "full tools/list JSON is {} characters",
             full.len()
         );
@@ -1466,7 +1605,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
         for name in [
             "scip_search",
             "scip_def",
@@ -1498,7 +1637,7 @@ mod tests {
                 .pointer("/result/tools")
                 .and_then(Value::as_array)
                 .map(Vec::len),
-            Some(10)
+            Some(11)
         );
 
         let messages = server.dispatch_messages(
@@ -1561,15 +1700,68 @@ mod tests {
     fn missing_index_is_a_tool_error_with_recovery_hint() {
         let project = TestProject::new();
         let mut server = Server::default();
-        let result = server.call_tool(
-            "scip_find",
-            &json!({
-                "project_root": project.root,
-                "name": "format"
-            }),
-        );
-        assert!(result.is_error);
-        assert!(result.text.contains("call scip_index first"));
+        for (tool, arguments) in [
+            (
+                "scip_find",
+                json!({"project_root": project.root, "name": "format"}),
+            ),
+            ("scip_architecture", json!({"project_root": project.root})),
+        ] {
+            let result = server.call_tool(tool, &arguments);
+            assert!(result.is_error, "{tool}");
+            assert!(result.text.contains("call scip_index first"), "{tool}");
+        }
+        assert!(!project.root.join(".scip-nav/index.scip").exists());
+        assert!(!project.root.join(".crux").exists());
+    }
+
+    #[test]
+    fn architecture_dispatch_validates_arguments_and_direction() {
+        let mut server = Server::default();
+        for arguments in [
+            json!({"project_root": "/tmp", "direction": "sideways"}),
+            json!({"project_root": "/tmp", "unknown": true}),
+            json!({"scope": "src"}),
+        ] {
+            let result = server.call_tool("scip_architecture", &arguments);
+            assert!(result.is_error);
+            assert!(result.text.contains("scip_architecture: invalid arguments"));
+            assert!(result.text.contains("Required: project_root"));
+        }
+    }
+
+    #[test]
+    fn architecture_projection_cache_reuses_and_invalidates_with_the_index() {
+        let project = TestProject::new();
+        let other_project = TestProject::new();
+        write_fixture(&project, false);
+        write_fixture(&other_project, false);
+        let mut server = Server::default();
+        let overview = json!({"project_root": project.root});
+        let other_overview = json!({"project_root": other_project.root});
+        let scoped = json!({
+            "project_root": project.root,
+            "scope": "src/lib"
+        });
+
+        let first = server.call_tool("scip_architecture", &overview);
+        let second = server.call_tool("scip_architecture", &scoped);
+        assert!(!first.is_error);
+        assert!(!second.is_error);
+        assert_eq!(server.architecture_build_count, 1);
+
+        let other = server.call_tool("scip_architecture", &other_overview);
+        let original_again = server.call_tool("scip_architecture", &overview);
+        assert!(!other.is_error);
+        assert!(!original_again.is_error);
+        assert_eq!(server.architecture_build_count, 2);
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_fixture(&project, true);
+        let refreshed = server.call_tool("scip_architecture", &overview);
+        assert!(!refreshed.is_error);
+        assert!(refreshed.text.contains("modules 7"));
+        assert_eq!(server.architecture_build_count, 3);
     }
 
     #[test]

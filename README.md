@@ -17,7 +17,8 @@ The larger the codebase, the larger the gain. The benchmark section contains the
 
 ## What crux is
 
-crux is an MCP server for AI coding agents. It reads a [SCIP](https://github.com/sourcegraph/scip) index of your code. It answers these questions in compact text:
+crux gives AI coding agents compiler-backed code navigation. It reads a [SCIP](https://github.com/sourcegraph/scip) index of your code.
+The MCP server returns compact answers for these questions:
 
 - Where is this symbol?
 - Who uses this symbol?
@@ -26,7 +27,9 @@ crux is an MCP server for AI coding agents. It reads a [SCIP](https://github.com
 
 The agent does not read full files to find these answers. Thus the agent uses fewer tokens.
 
-In session-shaped Codex CLI benchmarks, crux raised correct answers from 58% to 90%. Tokens per correct answer fell by 47%. On the hardest repository, they fell by 59%. The [Benchmark](#benchmark) section has details.
+In session-shaped Codex CLI benchmarks, crux raised correct answers from 58% to 90%. Tokens per correct answer fell by 47%.
+On the hardest repository, they fell by 59%. These results apply to the indexed code in the measured repositories.
+Index coverage limits every compiler-backed answer. The [Benchmark](#benchmark) section has details.
 
 ## Installation
 
@@ -46,10 +49,41 @@ As an alternative, build crux from source:
 cargo install --git https://github.com/pedr0v/crux
 ```
 
-## Updates
+## v0.11.0 quickstart
 
-Run `crux self-update` to install the latest standalone version.
-Run `crux self-update --check` to check for an update without an installation.
+Update Crux and refresh its persistent agent guidance:
+
+```sh
+crux self-update
+crux setup codex
+# Use `crux setup claude` for Claude Code.
+```
+
+Restart the client after setup. Restart any separate MCP process if the client keeps it running.
+Run `crux self-update --check` to check for an update without installing it.
+
+### Ask through MCP
+
+Ask a normal architecture question after setup.
+There is no `/crux` slash command.
+The persistent guidance tells the agent when to call `scip_architecture` automatically.
+
+The MCP tool reads an existing `.scip-nav/index.scip` and returns compact text.
+It does not create an index or architecture files.
+If the index is missing or stale, the agent can call `scip_index` as a separate tool.
+
+### Generate architecture files
+
+Run this command in a project:
+
+```sh
+crux architecture .
+```
+
+The command writes `graph.html`, `GRAPH_REPORT.md`, and `graph.json` to `.crux/architecture`.
+If the default index is missing, the command tries to create it first.
+Install the required [language indexer](#language-support) before automatic indexing.
+
 ## Setup
 
 ### Codex CLI
@@ -88,7 +122,8 @@ For files that crux changes, it adds marker-delimited blocks and creates a `<fil
 
 Run `crux unsetup codex` or `crux unsetup claude` to reverse the corresponding setup. Repeat the `--project` option when setup used it.
 
-The agent creates the index automatically on first use. The first query in a large project takes longer because it builds the index.
+If a query reports a missing or stale index, the guidance tells the agent to call `scip_index` once.
+This explicit index step can take longer in a large project.
 
 <details>
 <summary>Manual setup</summary>
@@ -120,9 +155,11 @@ Run `crux setup codex` once to install that note. Crux leaves an existing manual
 
 ## Profiles
 
-Use `--profile slim|full` to select the tool surface. The `slim` profile is the default and advertises five tools, including `scip_expand`.
+Use `--profile slim|full` to select the tool surface.
+The default `slim` profile advertises the six tools in the next table.
 
-Call `scip_expand` to reveal five narrow tools during a slim session. The `full` profile advertises all ten tools from the start.
+Call `scip_expand` to reveal five narrow tools during a slim session.
+The `full` profile advertises all eleven tools from the start.
 
 For example:
 
@@ -137,6 +174,7 @@ You can also set `CRUX_PROFILE=full`. The `--profile` flag overrides the environ
 | Tool | Function |
 | --- | --- |
 | `scip_index` | Finds project languages and sub-projects. Creates or refreshes the merged SCIP index. |
+| `scip_architecture` | Shows compact module dependencies, package boundaries, cycles, and coverage. |
 | `scip_find` | Finds symbol candidates by name. It can find unreferenced symbols. |
 | `scip_map` | Shows definitions, signatures, reference sites, and callers for a maximum of eight symbol names. |
 | `scip_outline` | Shows the definition structure of one file. |
@@ -153,6 +191,45 @@ The `full` profile and `scip_expand` add these narrow tools:
 | `scip_refs` | Shows reference lines for one symbol, in groups by file. |
 | `scip_callers` | Shows the direct or transitive callers of one function. |
 | `scip_dead` | Shows exports with no references in other files. Use it before you delete code. |
+
+## Architecture navigation
+
+Use `scip_architecture` for module dependencies, package boundaries, cycles, or unclear multi-file scope.
+Pass a known project-relative file or directory as `scope` when possible.
+The tool returns direct incoming and outgoing dependencies.
+Incoming dependencies show possible impact evidence, not transitive impact.
+Reuse a result until the index changes.
+
+Use `scip_map` for named-symbol references and callers.
+Use `scip_outline` for the symbols in one file.
+Use `scip_find` for name fragments or unreferenced audits.
+Use `rg` for simple text or definition searches.
+
+The CLI accepts custom index and output paths:
+
+```sh
+crux architecture /path/to/project \
+  --index /path/to/index.scip \
+  --output ./architecture
+```
+
+The project defaults to the current directory.
+The output defaults to `<project>/.crux/architecture`.
+
+| File | Content |
+| --- | --- |
+| `graph.html` | An offline graph with search, selection details, and direction controls. |
+| `GRAPH_REPORT.md` | A readable architecture report with package boundaries and cycles. |
+| `graph.json` | Stable graph data for tools and further analysis. |
+
+Crux derives dependencies from SCIP definitions and references.
+The result includes only data in the index.
+Runtime, generated, and reflective dependencies appear only when the indexer emits them.
+Coverage diagnostics report excluded malformed, unknown, and ambiguous references.
+
+The HTML view shows at most 600 nodes and 2,000 edges.
+The JSON and Markdown files keep the complete graph.
+See [architecture navigation](doc/architecture-navigation.md) for query details and evaluation evidence.
 
 ## Migration from 0.5.x
 

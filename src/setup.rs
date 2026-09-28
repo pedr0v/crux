@@ -8,7 +8,7 @@ use std::process::{Command, Output};
 
 const BEGIN_MARKER: &str = "# --- crux begin ---";
 const END_MARKER: &str = "# --- crux end ---";
-const ADOPTION_BODY: &str = "## crux code index\n\nThis project may have a crux code index.\n\nStart with one precise Crux query for references, callers, change impact, or dead code. Prefer rg for simple text searches or definition lookup. If Crux returns no relevant match, switch to rg or another repository-native search. Do not repeat the same or an equivalent empty Crux query.";
+const ADOPTION_BODY: &str = "## crux code index\n\nThis project may have a crux code index.\n\nUse `scip_architecture` once for explicit architecture questions, module or package dependencies, cycles, or unclear scope before a change across files. Pass a known project-relative file or directory as `scope`. Reuse relevant results until the index changes. Use `scip_map` for named-symbol references and callers. Use `scip_outline` for one file's symbols. Use `scip_find` for fragments or unreferenced audits. Prefer `rg` for simple text or definition search. Do not require architecture before every edit or symbol query. If a Crux result is empty, use repository-native search and stop equivalent retries.";
 const CODEX_REQUIRED_KEYS: [(&str, &str); 3] = [
     ("required", "required = true"),
     ("startup_timeout_sec", "startup_timeout_sec = 30"),
@@ -596,10 +596,14 @@ mod tests {
 
     #[test]
     fn adoption_guidance_routes_queries_and_stops_empty_retries() {
-        assert!(ADOPTION_BODY.contains("one precise Crux query for references, callers"));
-        assert!(ADOPTION_BODY.contains("Prefer rg for simple text searches or definition lookup"));
-        assert!(ADOPTION_BODY.contains("If Crux returns no relevant match, switch to rg"));
-        assert!(ADOPTION_BODY.contains("Do not repeat the same or an equivalent empty Crux query"));
+        assert!(ADOPTION_BODY.contains("Use `scip_architecture` once"));
+        assert!(ADOPTION_BODY.contains("Pass a known project-relative file or directory"));
+        assert!(ADOPTION_BODY.contains("Use `scip_map` for named-symbol references and callers"));
+        assert!(ADOPTION_BODY.contains("Use `scip_outline` for one file's symbols"));
+        assert!(ADOPTION_BODY.contains("Use `scip_find` for fragments"));
+        assert!(ADOPTION_BODY.contains("Prefer `rg` for simple text or definition search"));
+        assert!(ADOPTION_BODY.contains("Do not require architecture before every edit"));
+        assert!(ADOPTION_BODY.contains("stop equivalent retries"));
     }
 
     #[test]
