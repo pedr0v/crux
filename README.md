@@ -58,7 +58,7 @@ As an alternative, build crux from source:
 cargo install --git https://github.com/pedr0v/crux
 ```
 
-## v0.11.0 quickstart
+## v0.12.0 quickstart
 
 Update Crux and refresh its persistent agent guidance:
 
