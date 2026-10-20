@@ -191,7 +191,11 @@ fn architecture_cli_reports_an_action_for_a_missing_explicit_index() {
     let error = String::from_utf8_lossy(&result.stderr);
     assert!(error.contains("index not found"));
     assert!(error.contains("omit --index"));
-    assert!(error.contains(".scip-nav/index.scip"));
+    // The message prints the path with the native separator.
+    assert!(
+        error.contains(".scip-nav") && error.contains("index.scip"),
+        "{error}"
+    );
 }
 
 #[test]
