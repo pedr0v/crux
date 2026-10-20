@@ -1460,10 +1460,11 @@ mod tests {
         let empty = existing_registration_message("", current_exe);
         assert!(!empty.contains(unchanged), "{empty}");
         assert!(empty.contains("Crux kept it"), "{empty}");
-        assert!(
-            empty.contains("claude mcp add --scope user crux -- '/opt/crux/bin/crux'"),
-            "{empty}"
+        let add_command = format!(
+            "claude mcp add --scope user crux -- {}",
+            shell_quote(current_exe)
         );
+        assert!(empty.contains(&add_command), "{empty}");
     }
 
     #[test]

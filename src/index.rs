@@ -1680,7 +1680,7 @@ mod tests {
     fn cpp_indexer_command_prefers_root_then_build_compdb() {
         let project = TestProject::new();
         fs::create_dir_all(project.root.join("build")).expect("create build directory");
-        let build_compdb = project.root.join("build/compile_commands.json");
+        let build_compdb = project.root.join("build").join("compile_commands.json");
         fs::write(&build_compdb, "[]").expect("write build compilation database");
         let output_path = pending_language_index_path(&project.root, Language::Cpp);
 
