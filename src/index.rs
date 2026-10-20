@@ -4,9 +4,12 @@ use crate::update;
 use anyhow::{anyhow, bail, Context, Result};
 use protobuf::{Message, MessageField};
 use scip::types::{Index, Metadata};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 use std::sync::Arc;
@@ -122,8 +125,30 @@ pub(crate) struct LoadedIndex {
     file_size: u64,
 }
 
-struct CachedIndex {
+/// Identity of the canonical index file on disk.
+/// A rewrite inside one timestamp tick keeps the mtime.
+/// The size and (on Unix) the inode still tell the rewrite apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
     modified: SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl FileStamp {
+    fn from_metadata(metadata: &fs::Metadata) -> io::Result<Self> {
+        Ok(Self {
+            modified: metadata.modified()?,
+            len: metadata.len(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+struct CachedIndex {
+    stamp: FileStamp,
     loaded: LoadedIndex,
 }
 
@@ -151,12 +176,11 @@ impl IndexCache {
             }
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
-        let modified = metadata
-            .modified()
+        let stamp = FileStamp::from_metadata(&metadata)
             .with_context(|| format!("read mtime for {}", path.display()))?;
 
         if let Some(cached) = self.entries.get(project_root) {
-            if cached.modified == modified {
+            if cached.stamp == stamp {
                 return Ok(cached.loaded.clone());
             }
         }
@@ -165,7 +189,7 @@ impl IndexCache {
         self.entries.insert(
             project_root.to_path_buf(),
             CachedIndex {
-                modified,
+                stamp,
                 loaded: loaded.clone(),
             },
         );
@@ -275,7 +299,10 @@ fn relative_path_argument(path: &Path) -> String {
         .join("/")
 }
 
-fn sub_project_slug(relative: &Path) -> String {
+/// Build the readable file-name part of a sub-project path.
+/// The readable part replaces unsupported characters with `_`.
+/// This mapping is not unique. Index files before 0.12 used it alone.
+fn sub_project_readable(relative: &Path) -> String {
     relative
         .iter()
         .map(|component| {
@@ -293,6 +320,28 @@ fn sub_project_slug(relative: &Path) -> String {
         })
         .collect::<Vec<_>>()
         .join("__")
+}
+
+/// Build the file-name part for a sub-project path.
+/// A short digest of the exact path bytes follows the readable part.
+/// The digest reads the raw bytes, so two paths that differ only in
+/// invalid UTF-8 get different names.
+fn sub_project_slug(relative: &Path) -> String {
+    let readable = sub_project_readable(relative);
+    let mut hasher = Sha256::new();
+    for (position, component) in relative.iter().enumerate() {
+        if position > 0 {
+            hasher.update(b"/");
+        }
+        hasher.update(component.as_encoded_bytes());
+    }
+    let suffix = hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{readable}-{suffix}")
 }
 
 trait IndexSubProject {
@@ -971,7 +1020,19 @@ fn cleanup_stale_language_indexes(
     selected_languages: &[Language],
     successes: &[LanguageIndexResult],
     failures: &[LanguageIndexFailure],
-) -> Result<()> {
+) -> Result<Vec<String>> {
+    // A failed sub-project keeps its previous index. The previous file can
+    // still carry the pre-0.12 name without a digest, so keep that name too.
+    let legacy_failure_names = failures
+        .iter()
+        .filter(|failure| !failure.relative.as_os_str().is_empty())
+        .map(|failure| {
+            format!(
+                "index-{}-{}.scip",
+                failure.language,
+                sub_project_readable(&failure.relative)
+            )
+        });
     let expected_file_names = successes
         .iter()
         .map(|result| SubProject {
@@ -983,7 +1044,9 @@ fn cleanup_stale_language_indexes(
             language: failure.language,
         }))
         .map(|sub_project| language_index_file_name(&sub_project))
+        .chain(legacy_failure_names)
         .collect::<HashSet<_>>();
+    let mut removed = Vec::new();
     let directory = project_root.join(".scip-nav");
     let entries =
         fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?;
@@ -1006,9 +1069,11 @@ fn cleanup_stale_language_indexes(
         {
             fs::remove_file(entry.path())
                 .with_context(|| format!("remove stale index {}", entry.path().display()))?;
+            removed.push(file_name);
         }
     }
-    Ok(())
+    removed.sort();
+    Ok(removed)
 }
 
 fn write_index_atomically(index: &Index, pending_path: &Path, destination: &Path) -> Result<()> {
@@ -1257,7 +1322,18 @@ where
         }
     }
 
-    cleanup_stale_language_indexes(project_root, &selection.languages, &successes, &failures)?;
+    // Auto-detect mode rebuilds every detected language.
+    // Any other registered language index is stale, so cleanup covers all languages.
+    let cleanup_languages = if override_language.is_none() && override_languages.is_none() {
+        LANGUAGE_INDEXERS
+            .iter()
+            .map(|indexer| indexer.language)
+            .collect::<Vec<_>>()
+    } else {
+        selection.languages.clone()
+    };
+    let removed_stale =
+        cleanup_stale_language_indexes(project_root, &cleanup_languages, &successes, &failures)?;
 
     if successes.is_empty() {
         let failures = failures
@@ -1283,6 +1359,12 @@ where
         &selection,
         &warnings,
     );
+    if !removed_stale.is_empty() {
+        stats.push_str(&format!(
+            "\nremoved stale index files: {} (pass language or languages to keep an index of an undetected language)",
+            removed_stale.join(", ")
+        ));
+    }
     if let Some(notice) = pending_update.and_then(|pending| pending.try_notice()) {
         stats.push('\n');
         stats.push_str(&notice);
@@ -1377,11 +1459,13 @@ mod tests {
         }
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn write_index_file(path: &Path, index: &Index) {
         fs::write(path, index.write_to_bytes().expect("serialize test index"))
             .expect("write test index");
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn read_index_file(path: &Path) -> Index {
         let bytes = fs::read(path).expect("read test index");
         Index::parse_from_bytes(&bytes).expect("parse test index")
@@ -1395,6 +1479,7 @@ mod tests {
         )
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn disable_update_check(project: &TestProject) {
         fs::write(project.root.join(".scip-nav/update-check"), "").expect("disable update check");
     }
@@ -1934,8 +2019,87 @@ exit 23
 
         assert_eq!(
             language_index_file_name(&sub_project),
-            "index-rust-services__api_weird_v1.0.scip"
+            "index-rust-services__api_weird_v1.0-8aa9d413.scip"
         );
+    }
+
+    #[test]
+    fn slug_differs_for_paths_with_the_same_readable_part() {
+        let pairs = [
+            ("apps/foo bar", "apps/foo_bar"),
+            ("packages/a__b", "packages/a/b"),
+            ("apps/foo@bar", "apps/foo#bar"),
+        ];
+        for (first, second) in pairs {
+            let first_name = language_index_file_name(&SubProject {
+                relative: PathBuf::from(first),
+                language: Language::TypeScript,
+            });
+            let second_name = language_index_file_name(&SubProject {
+                relative: PathBuf::from(second),
+                language: Language::TypeScript,
+            });
+            assert_ne!(first_name, second_name, "{first} vs {second}");
+        }
+    }
+
+    #[test]
+    fn slug_is_stable_for_the_same_path() {
+        let relative = PathBuf::from("apps/foo bar");
+
+        assert_eq!(sub_project_slug(&relative), sub_project_slug(&relative));
+        assert!(sub_project_slug(&relative).starts_with("apps__foo_bar-"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sub_projects_with_colliding_readable_slugs_keep_separate_indexes() {
+        let project = TestProject::new();
+        disable_update_check(&project);
+        for directory in ["apps/foo bar", "apps/foo_bar"] {
+            fs::create_dir_all(project.root.join(directory)).expect("create sub-project");
+            fs::write(project.root.join(directory).join("package.json"), "{}")
+                .expect("write TypeScript marker");
+        }
+        let first_source = project.root.join("first.scip");
+        let second_source = project.root.join("second.scip");
+        write_index_file(
+            &first_source,
+            &test_index("file:///whatever", "typescript", &["src/first.ts"], &[]),
+        );
+        write_index_file(
+            &second_source,
+            &test_index("file:///whatever", "typescript", &["src/second.ts"], &[]),
+        );
+
+        let stats = run_indexer_with(
+            &project.root,
+            None,
+            None,
+            None,
+            None,
+            &mut IndexCache::default(),
+            |_, sub_project_root, output, _| {
+                if sub_project_root.ends_with("foo bar") {
+                    copy_index_command(&first_source, output)
+                } else {
+                    copy_index_command(&second_source, output)
+                }
+            },
+        )
+        .expect("index both sub-projects");
+
+        let mut paths = read_index_file(&index_path(&project.root))
+            .documents
+            .iter()
+            .map(|document| document.relative_path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["apps/foo bar/src/first.ts", "apps/foo_bar/src/second.ts"]
+        );
+        assert!(stats.contains("merged: documents 2"));
     }
 
     #[cfg(unix)]
@@ -2004,7 +2168,13 @@ exit 23
         fs::create_dir_all(&directory).expect("create index directory");
         let stale_path = directory.join("index-rust-old__crate.scip");
         let unselected_path = directory.join("index-typescript.scip");
-        let failed_path = directory.join("index-rust-failed.scip");
+        let failed_path = language_index_path(
+            &project.root,
+            &SubProject {
+                relative: PathBuf::from("failed"),
+                language: Language::Rust,
+            },
+        );
         write_index_file(
             &stale_path,
             &test_index("file:///old", "rust", &["old/crate/src/lib.rs"], &[]),
@@ -2267,6 +2437,122 @@ exit 23
 
     #[cfg(unix)]
     #[test]
+    fn auto_detect_removes_index_of_language_that_is_no_longer_detected() {
+        let project = TestProject::new();
+        disable_update_check(&project);
+        fs::write(project.root.join("package.json"), "{}").expect("write TypeScript marker");
+        let project_root = project.root.to_string_lossy();
+        let stale_rust = language_index_path(&project.root, Language::Rust);
+        let stale_sub_project = language_index_path(
+            &project.root,
+            &SubProject {
+                relative: PathBuf::from("services/api"),
+                language: Language::Python,
+            },
+        );
+        write_index_file(
+            &stale_rust,
+            &test_index(&project_root, "rust", &["src/lib.rs"], &[]),
+        );
+        write_index_file(
+            &stale_sub_project,
+            &test_index(&project_root, "python", &["services/api/main.py"], &[]),
+        );
+        let typescript_source = project.root.join("typescript.scip");
+        write_index_file(
+            &typescript_source,
+            &test_index(&project_root, "typescript", &["src/app.ts"], &[]),
+        );
+
+        let stats = run_indexer_with(
+            &project.root,
+            None,
+            None,
+            None,
+            None,
+            &mut IndexCache::default(),
+            |language, _, output, _| match language {
+                Language::TypeScript => copy_index_command(&typescript_source, output),
+                _ => panic!("unexpected language {language}"),
+            },
+        )
+        .expect("index detected language");
+
+        assert!(!stale_rust.exists());
+        assert!(!stale_sub_project.exists());
+        assert!(language_index_path(&project.root, Language::TypeScript).is_file());
+        let merged = read_index_file(&index_path(&project.root));
+        assert_eq!(merged.documents.len(), 1);
+        assert_eq!(merged.documents[0].relative_path, "src/app.ts");
+        assert!(stats.contains("merged: documents 1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_detect_keeps_failed_sub_project_index_and_removes_other_stale_indexes() {
+        let project = TestProject::new();
+        disable_update_check(&project);
+        fs::create_dir_all(project.root.join("ok")).expect("create working sub-project");
+        fs::create_dir_all(project.root.join("bad")).expect("create failing sub-project");
+        fs::write(project.root.join("ok/package.json"), "{}").expect("write working marker");
+        fs::write(project.root.join("bad/package.json"), "{}").expect("write failing marker");
+        let project_root = project.root.to_string_lossy();
+        let failed_path = language_index_path(
+            &project.root,
+            &SubProject {
+                relative: PathBuf::from("bad"),
+                language: Language::TypeScript,
+            },
+        );
+        let stale_rust = language_index_path(&project.root, Language::Rust);
+        write_index_file(
+            &failed_path,
+            &test_index(&project_root, "typescript", &["bad/src/app.ts"], &[]),
+        );
+        write_index_file(
+            &stale_rust,
+            &test_index(&project_root, "rust", &["src/lib.rs"], &[]),
+        );
+        let source = project.root.join("ok.scip");
+        write_index_file(
+            &source,
+            &test_index(&project_root, "typescript", &["src/app.ts"], &[]),
+        );
+
+        let stats = run_indexer_with(
+            &project.root,
+            None,
+            None,
+            None,
+            None,
+            &mut IndexCache::default(),
+            |_, sub_project_root, output, _| {
+                if sub_project_root.ends_with("ok") {
+                    copy_index_command(&source, output)
+                } else {
+                    (
+                        "sh".to_string(),
+                        vec!["-c".to_string(), "exit 17".to_string()],
+                    )
+                }
+            },
+        )
+        .expect("index working sub-project");
+
+        assert!(failed_path.exists());
+        assert!(!stale_rust.exists());
+        let mut paths = read_index_file(&index_path(&project.root))
+            .documents
+            .iter()
+            .map(|document| document.relative_path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, vec!["bad/src/app.ts", "ok/src/app.ts"]);
+        assert!(stats.contains("failed:"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn language_list_reindexes_one_language_and_retains_other_index() {
         let project = TestProject::new();
         disable_update_check(&project);
@@ -2452,5 +2738,90 @@ exit 23
 
         let second = cache.load(&project.root).expect("reload");
         assert_eq!(second.index.index().documents.len(), 7);
+    }
+
+    fn set_file_modified(path: &Path, modified: SystemTime) {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open index for mtime update")
+            .set_modified(modified)
+            .expect("set index mtime");
+    }
+
+    #[test]
+    fn cache_reloads_when_size_changes_and_mtime_stays_equal() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let path = index_path(&project.root);
+        let first_mtime = fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .expect("first mtime");
+        let first_size = fs::metadata(&path).expect("first metadata").len();
+        #[cfg(unix)]
+        let first_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&path).expect("first metadata").ino()
+        };
+        let mut cache = IndexCache::default();
+        let first = cache.load(&project.root).expect("first load");
+        assert_eq!(first.index.index().documents.len(), 6);
+
+        write_fixture(&project, true);
+        set_file_modified(&path, first_mtime);
+        let rewritten = fs::metadata(&path).expect("rewritten metadata");
+        assert_eq!(rewritten.modified().expect("rewritten mtime"), first_mtime);
+        assert_ne!(rewritten.len(), first_size);
+        // The size check alone must trigger the reload.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(rewritten.ino(), first_inode);
+        }
+
+        let second = cache.load(&project.root).expect("reload");
+        assert_eq!(second.index.index().documents.len(), 7);
+    }
+
+    #[test]
+    fn cache_serves_the_loaded_index_when_the_file_is_unchanged() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let mut cache = IndexCache::default();
+        let first = cache.load(&project.root).expect("first load");
+        let second = cache.load(&project.root).expect("second load");
+
+        assert!(Arc::ptr_eq(&first.index, &second.index));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_reloads_when_inode_changes_and_mtime_and_size_stay_equal() {
+        let project = TestProject::new();
+        let path = index_path(&project.root);
+        write_index_file(
+            &path,
+            &test_index("file:///project", "typescript", &["src/a.ts"], &[]),
+        );
+        let before = fs::metadata(&path).expect("first metadata");
+        let first_mtime = before.modified().expect("first mtime");
+        let mut cache = IndexCache::default();
+        let first = cache.load_for_check(&project.root).expect("first load");
+        assert_eq!(first.index.index().documents[0].relative_path, "src/a.ts");
+
+        let replacement = project.root.join("replacement.scip");
+        write_index_file(
+            &replacement,
+            &test_index("file:///project", "typescript", &["src/b.ts"], &[]),
+        );
+        set_file_modified(&replacement, first_mtime);
+        fs::rename(&replacement, &path).expect("replace index");
+        let after = fs::metadata(&path).expect("replaced metadata");
+        assert_eq!(after.modified().expect("replaced mtime"), first_mtime);
+        assert_eq!(after.len(), before.len());
+        assert_ne!(after.ino(), before.ino());
+
+        let second = cache.load_for_check(&project.root).expect("reload");
+        assert_eq!(second.index.index().documents[0].relative_path, "src/b.ts");
     }
 }
