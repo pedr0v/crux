@@ -2259,6 +2259,45 @@ mod tests {
     }
 
     #[test]
+    fn compact_pages_past_the_end_return_a_restart_hint() {
+        let a = "rust-analyzer cargo app 1.0.0 a().";
+        let b = "rust-analyzer cargo app 1.0.0 b().";
+        let index = Index {
+            documents: vec![
+                document("src/a.rs", &[(a, true), (b, false)]),
+                document("src/b.rs", &[(b, true), (a, false)]),
+            ],
+            ..Default::default()
+        };
+        let projection = ArchitectureProjection::new(&SemanticIndex::new(index));
+        let overview = projection
+            .query(ArchitectureQuery {
+                scope: None,
+                direction: ArchitectureDirection::Both,
+                limit: 20,
+                offset: 50,
+            })
+            .unwrap();
+        assert!(overview
+            .contains("central modules:\n- no entries at offset 50; total 2 (use offset=0)"));
+
+        let scoped = projection
+            .query(ArchitectureQuery {
+                scope: Some("src/a.rs"),
+                direction: ArchitectureDirection::Both,
+                limit: 20,
+                offset: 50,
+            })
+            .unwrap();
+        assert!(
+            scoped.contains("scope modules:\n- no entries at offset 50; total 1 (use offset=0)")
+        );
+        assert!(scoped.contains(
+            "direct outgoing dependencies:\n- no entries at offset 50; total 1 (use offset=0)"
+        ));
+    }
+
+    #[test]
     fn compact_scope_matching_uses_path_component_boundaries() {
         let foo = "rust-analyzer cargo app 1.0.0 foo().";
         let foobar = "rust-analyzer cargo app 1.0.0 foobar().";

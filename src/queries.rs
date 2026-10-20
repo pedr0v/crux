@@ -1,6 +1,6 @@
 use crate::render::{
     display_name, inferred_kind, qualified_name, symbol_details, symbol_label, symbol_signature,
-    SourceCache,
+    SourceCache, SourceLanguage,
 };
 use crate::semantic::{
     definition_line, has_member_descriptor_shape, CallerWalk, DeadCandidate, MatchingSymbols,
@@ -82,6 +82,9 @@ fn symbol_candidates(
         .flat_map(|document| document.symbols.iter())
         .chain(index.index().external_symbols.iter());
     let mut candidates = Vec::new();
+    // Symbols with one display name share one family. Compute each family
+    // one time, so the unreferenced audit does not repeat the same lookup.
+    let mut families: HashMap<String, MatchingSymbols> = HashMap::new();
     for information in information {
         let Some((file, line)) = index.definition_site(&information.symbol).cloned() else {
             continue;
@@ -101,7 +104,9 @@ fn symbol_candidates(
             continue;
         };
         if unreferenced {
-            let family = matching_symbol_ids(index, &display);
+            let family = families
+                .entry(display.clone())
+                .or_insert_with(|| matching_symbol_ids(index, &display));
             let has_inbound_references =
                 family
                     .reference_symbols(&information.symbol)
@@ -205,6 +210,9 @@ pub(crate) fn find(
     let total = candidates.len();
     if total == 0 {
         return Ok("no matches".to_string());
+    }
+    if offset >= total {
+        return Ok(past_end_message(offset, total));
     }
 
     let mut lines = candidates
@@ -362,6 +370,7 @@ pub(crate) fn dead_exports(
         {
             continue;
         }
+        let language = SourceLanguage::of_document(&document.language, &document.relative_path);
         for occurrence in &document.occurrences {
             if !is_definition(occurrence) {
                 continue;
@@ -385,7 +394,7 @@ pub(crate) fn dead_exports(
             if exports_only
                 && (has_member_descriptor_shape(information)
                     || sources
-                        .is_exported_declaration(&document.relative_path, line)
+                        .is_exported_declaration(&document.relative_path, line, language, &name)
                         .is_some_and(|exported| !exported))
             {
                 continue;
@@ -467,6 +476,12 @@ pub(crate) fn dead_exports(
     Ok(lines.join("\n"))
 }
 
+/// Tells the client that the offset is past the last result. The wording
+/// is the same as the paginated sections of `scip_architecture`.
+pub(crate) fn past_end_message(offset: usize, total: usize) -> String {
+    format!("no entries at offset {offset}; total {total} (use offset=0)")
+}
+
 fn format_limited_output(
     lines: Vec<String>,
     limit: usize,
@@ -476,6 +491,9 @@ fn format_limited_output(
     let total = lines.len();
     if total == 0 {
         return "no matches".to_string();
+    }
+    if offset >= total {
+        return past_end_message(offset, total);
     }
     let mut output = lines
         .into_iter()
@@ -743,6 +761,10 @@ fn append_limited_section(
     if total == 0 {
         lines.push("none".to_string());
         return false;
+    }
+    if offset >= total {
+        lines.push(past_end_message(offset, total));
+        return true;
     }
     let shown_count = total.saturating_sub(offset).min(limit);
     let next_offset = offset.saturating_add(shown_count);
@@ -1016,10 +1038,28 @@ pub(crate) fn references(
     if let Some(response) = ambiguity_response(index, name, &symbols) {
         return Ok(response);
     }
-    let reference_symbols = symbols.all_reference_symbols();
+    // Only principals with a definition site contribute references.
+    // A foreign same-name symbol has no definition site in this index.
+    let defined = symbols
+        .principals
+        .iter()
+        .filter(|symbol| index.definition_site(symbol).is_some())
+        .collect::<Vec<_>>();
+    let reference_symbols: HashSet<String> = if defined.is_empty() {
+        symbols
+            .all_reference_symbols()
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    } else {
+        defined
+            .iter()
+            .flat_map(|symbol| symbols.reference_symbols(symbol))
+            .collect()
+    };
 
     let locations = reference_symbols
-        .into_iter()
+        .iter()
         .filter_map(|symbol| index.references_for(symbol))
         .flat_map(|sites| sites.iter())
         .map(|(file, line)| (file.clone(), line + 1))
@@ -1029,6 +1069,9 @@ pub(crate) fn references(
     }
 
     let total = locations.len();
+    if offset >= total {
+        return Ok(past_end_message(offset, total));
+    }
     let shown_locations = locations
         .into_iter()
         .skip(offset)
@@ -1123,7 +1166,7 @@ mod tests {
         DEFAULT_CALLERS_LIMIT, DEFAULT_DEAD_LIMIT, DEFAULT_MAP_REFS_LIMIT, DEFAULT_REFS_LIMIT,
     };
     use crate::test_support::*;
-    use scip::types::{symbol_information, Document, SymbolInformation};
+    use scip::types::{symbol_information, Document, Index, SymbolInformation};
     use std::fs;
 
     #[test]
@@ -1807,6 +1850,254 @@ mod tests {
         assert_eq!(
             output,
             "# dead exports (exports_only=false) — dynamic/string-based uses aren't visible to SCIP\nfile-local: function localOnly src/lib/dead.ts:2 (x1 in-file)\ndead: function neverUsed src/lib/dead.ts:11\ndead: method run src/lib/dead.ts:16\ndead: constant LIMIT src/lib/dead.ts:18\ndead: constant helper src/lib/dead.ts:19"
+        );
+    }
+
+    #[test]
+    fn foreign_same_name_symbols_do_not_add_references_or_hide_dead_code() {
+        let foreign = "scip-typescript npm some-lib 2.0.0 lib/Other#formatDate().";
+        let stdlib = "scip-python python python-stdlib 3.11 builtins/str#neverUsed().";
+        let mut index = fixture(false);
+        for (symbol, name) in [(foreign, "formatDate"), (stdlib, "neverUsed")] {
+            index.external_symbols.push(SymbolInformation {
+                symbol: symbol.to_string(),
+                display_name: name.to_string(),
+                ..Default::default()
+            });
+        }
+        let app = index
+            .documents
+            .iter_mut()
+            .find(|document| document.relative_path == "src/app.ts")
+            .expect("app document");
+        app.occurrences.push(legacy_occurrence(foreign, 24, false));
+        app.occurrences.push(legacy_occurrence(stdlib, 29, false));
+        let index = SemanticIndex::new(index);
+
+        let refs = references(&index, "date.ts/formatDate().", DEFAULT_REFS_LIMIT, 0)
+            .expect("qualified refs");
+        assert!(refs.contains("src/app.ts: 8, 12, 40"), "{refs}");
+        assert!(!refs.contains("25"), "{refs}");
+
+        let plain = references(&index, "formatDate", DEFAULT_REFS_LIMIT, 0)
+            .expect("references by plain name");
+        assert!(plain.contains("src/app.ts: 8, 12, 40"), "{plain}");
+        assert!(!plain.contains("25"), "{plain}");
+
+        let unreferenced = find(&index, "*", 100, 0, true).expect("unreferenced candidates");
+        assert!(
+            unreferenced.contains("dead.ts/neverUsed(). | function | src/lib/dead.ts:11"),
+            "{unreferenced}"
+        );
+    }
+
+    #[test]
+    fn map_symbols_keeps_plain_return_references() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let mut index = fixture(false);
+        for file in ["src/factory_bare.py", "src/factory_semi.ts"] {
+            index.documents.push(Document {
+                relative_path: file.to_string(),
+                occurrences: vec![legacy_occurrence(DATE_SYMBOL, 3, false)],
+                ..Default::default()
+            });
+        }
+        fs::write(
+            project.root.join("src/factory_bare.py"),
+            "import date\n\ndef factory():\n    return formatDate\n",
+        )
+        .expect("write bare factory");
+        fs::write(
+            project.root.join("src/factory_semi.ts"),
+            "import x from './x';\n\nfunction factory() {\n  return formatDate;\n}\n",
+        )
+        .expect("write semicolon factory");
+        let index = SemanticIndex::new(index);
+
+        let output = map_symbols(
+            &project.root,
+            &index,
+            &["date.ts/formatDate().".to_string()],
+            DEFAULT_MAP_REFS_LIMIT,
+            0,
+        )
+        .expect("map with return references");
+        assert!(
+            output.contains("src/factory_bare.py:4: return formatDate"),
+            "{output}"
+        );
+        assert!(
+            output.contains("src/factory_semi.ts:4: return formatDate;"),
+            "{output}"
+        );
+        assert!(
+            output.contains("<module> src/factory_bare.py (x1)"),
+            "{output}"
+        );
+        assert!(!output.contains("src/app.ts:8:"), "{output}");
+    }
+
+    #[test]
+    fn scip_dead_exports_only_keeps_typescript_export_filtering() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let output = dead_exports(
+            &project.root,
+            &SemanticIndex::new(fixture(false)),
+            Some("src/lib/dead.ts"),
+            DEFAULT_DEAD_LIMIT,
+            true,
+        )
+        .expect("exported dead declarations");
+        assert_eq!(
+            output,
+            "# dead exports (exports_only=true) — dynamic/string-based uses aren't visible to SCIP\nfile-local: function localOnly src/lib/dead.ts:2 (x1 in-file)\ndead: function neverUsed src/lib/dead.ts:11\ndead: constant LIMIT src/lib/dead.ts:18"
+        );
+    }
+
+    #[test]
+    fn scip_dead_exports_only_uses_the_visibility_rules_of_each_language() {
+        let project = TestProject::new();
+        let documents = [
+            (
+                "rust",
+                "src/lib.rs",
+                "rust-analyzer cargo app 1.0.0",
+                "pub fn never_used() {}\nfn private_helper() {}\n",
+                ["never_used", "private_helper"],
+            ),
+            (
+                "",
+                "pkg/module.py",
+                "scip-python python app 1.0.0 `pkg.module`/",
+                "def unused():\n    def nested():\n        pass\n",
+                ["unused", "nested"],
+            ),
+            (
+                "go",
+                "cmd/main.go",
+                "scip-go gomod app 1.0.0 `app/cmd`/",
+                "func Exported() {}\nfunc unexported() {}\n",
+                ["Exported", "unexported"],
+            ),
+        ];
+        let mut index = Index::default();
+        for (language, file, prefix, source, names) in documents {
+            let path = project.root.join(file);
+            fs::create_dir_all(path.parent().expect("source parent")).expect("create parent");
+            fs::write(path, source).expect("write language source");
+            let mut document = Document {
+                language: language.to_string(),
+                relative_path: file.to_string(),
+                ..Default::default()
+            };
+            for (line, name) in names.into_iter().enumerate() {
+                let symbol = if prefix.ends_with('/') {
+                    format!("{prefix}{name}().")
+                } else {
+                    format!("{prefix} {name}().")
+                };
+                document.symbols.push(symbol_information(
+                    &symbol,
+                    name,
+                    symbol_information::Kind::Function,
+                    &format!("fn {name}()"),
+                    "Language fixture.",
+                ));
+                document
+                    .occurrences
+                    .push(legacy_occurrence(&symbol, line as i32, true));
+            }
+            index.documents.push(document);
+        }
+
+        let output = dead_exports(
+            &project.root,
+            &SemanticIndex::new(index),
+            None,
+            DEFAULT_DEAD_LIMIT,
+            true,
+        )
+        .expect("dead exports across languages");
+        assert_eq!(
+            output,
+            "# dead exports (exports_only=true) — dynamic/string-based uses aren't visible to SCIP\ndead: function Exported cmd/main.go:1\ndead: function unused pkg/module.py:1\ndead: function never_used src/lib.rs:1"
+        );
+    }
+
+    #[test]
+    fn unreferenced_find_scales_to_many_symbols_with_shared_names() {
+        let mut index = Index::default();
+        for number in 0..5000 {
+            // Half of the names repeat. The other half is unique.
+            // The unique names only stay fast with the O(1) name tables.
+            let name = if number % 2 == 0 {
+                format!("shared{}", number % 50)
+            } else {
+                format!("unique{number}")
+            };
+            let symbol = format!("scip-typescript npm fixture 1.0.0 file{number}.ts/{name}().");
+            index.documents.push(Document {
+                language: "typescript".to_string(),
+                relative_path: format!("src/file{number}.ts"),
+                occurrences: vec![legacy_occurrence(&symbol, 0, true)],
+                symbols: vec![symbol_information(
+                    &symbol,
+                    &name,
+                    symbol_information::Kind::Function,
+                    &format!("function {name}(): void"),
+                    "Scale fixture.",
+                )],
+                ..Default::default()
+            });
+        }
+        let index = SemanticIndex::new(index);
+
+        let started = std::time::Instant::now();
+        let output = find(&index, "*", 20, 0, true).expect("unreferenced sweep");
+        let elapsed = started.elapsed();
+        assert_eq!(output.lines().count(), 21);
+        assert!(output.ends_with("… 4980 more (pass offset=20)"), "{output}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "unreferenced sweep took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn offsets_past_the_end_return_a_restart_hint() {
+        let project = TestProject::new();
+        write_fixture(&project, false);
+        let index = SemanticIndex::new(fixture(false));
+
+        assert_eq!(
+            find(&index, "formatDate", 10, 500, false).expect("find past end"),
+            "no entries at offset 500; total 2 (use offset=0)"
+        );
+        assert_eq!(
+            outline(&index, "src/lib/date.ts", 10, 2).expect("outline past end"),
+            "no entries at offset 2; total 2 (use offset=0)"
+        );
+        assert_eq!(
+            references(&index, "formatDate", 10, 4).expect("refs past end"),
+            "no entries at offset 4; total 4 (use offset=0)"
+        );
+        let mapped = map_symbols(
+            &project.root,
+            &index,
+            &["date.ts/formatDate().".to_string()],
+            DEFAULT_MAP_REFS_LIMIT,
+            50,
+        )
+        .expect("map past end");
+        assert!(
+            mapped.contains("references:\nno entries at offset 50; total 2 (use offset=0)"),
+            "{mapped}"
+        );
+        assert!(
+            mapped.contains("callers:\nno entries at offset 50; total 2 (use offset=0)"),
+            "{mapped}"
         );
     }
 

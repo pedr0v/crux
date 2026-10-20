@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 type DefinitionSites = HashMap<String, (String, usize)>;
 type ReferenceSites = HashMap<String, BTreeSet<(String, usize)>>;
+type SymbolsByName = HashMap<String, Vec<String>>;
 
 #[derive(Clone, Copy)]
 enum SymbolInformationPosition {
@@ -26,6 +27,54 @@ pub(crate) struct SemanticIndex {
     callable_definitions: HashMap<String, Vec<CallableDefinition>>,
     definition_sites: DefinitionSites,
     reference_sites_by_symbol: ReferenceSites,
+    names: NameTables,
+}
+
+/// Name lookup tables. `SemanticIndex::new` builds them once, so a name
+/// lookup does not parse every symbol again.
+struct NameTables {
+    /// Display name -> symbols with that display name, in index order.
+    by_display_name: SymbolsByName,
+    /// Qualified name -> symbols with that qualified name, in index order.
+    by_qualified_name: SymbolsByName,
+    /// Symbol -> display name of the information that `information` returns.
+    display_name_by_symbol: HashMap<String, String>,
+}
+
+impl NameTables {
+    fn new(index: &Index, positions: &HashMap<String, SymbolInformationPosition>) -> Self {
+        let mut by_display_name = SymbolsByName::new();
+        let mut by_qualified_name = SymbolsByName::new();
+        let all = index
+            .documents
+            .iter()
+            .flat_map(|document| document.symbols.iter())
+            .chain(index.external_symbols.iter());
+        for information in all {
+            by_display_name
+                .entry(display_name(information))
+                .or_default()
+                .push(information.symbol.clone());
+            by_qualified_name
+                .entry(qualified_name(information))
+                .or_default()
+                .push(information.symbol.clone());
+        }
+        let display_name_by_symbol = positions
+            .iter()
+            .map(|(symbol, position)| {
+                (
+                    symbol.clone(),
+                    display_name(symbol_information_at(index, *position)),
+                )
+            })
+            .collect();
+        Self {
+            by_display_name,
+            by_qualified_name,
+            display_name_by_symbol,
+        }
+    }
 }
 
 impl SemanticIndex {
@@ -33,6 +82,7 @@ impl SemanticIndex {
         let symbol_information_by_id = symbol_information_positions(&index);
         let callable_definitions = build_callable_definitions(&index, &symbol_information_by_id);
         let (definition_sites, reference_sites_by_symbol) = symbol_sites(&index);
+        let names = NameTables::new(&index, &symbol_information_by_id);
 
         Self {
             index,
@@ -40,6 +90,7 @@ impl SemanticIndex {
             callable_definitions,
             definition_sites,
             reference_sites_by_symbol,
+            names,
         }
     }
 
@@ -268,37 +319,60 @@ fn symbol_information_richness(information: &SymbolInformation) -> (bool, bool) 
     (has_kind, has_documentation)
 }
 
-pub(crate) fn matching_symbol_ids(index: &SemanticIndex, name: &str) -> MatchingSymbols {
-    let all = index
-        .index()
-        .documents
-        .iter()
-        .flat_map(|document| document.symbols.iter())
-        .chain(index.index().external_symbols.iter());
-    let name_lower = name.to_lowercase();
-    let symbols = all.collect::<Vec<_>>();
-    let mut matches = symbols
-        .iter()
-        .filter(|information| {
-            display_name(information) == name
-                || qualified_name(information) == name
-                || information.symbol == name
-        })
-        .map(|information| information.symbol.clone())
-        .collect::<HashSet<_>>();
-    let exact_match = !matches.is_empty();
+/// Returns the package identity of a symbol: scheme, manager, and name.
+/// The version is not part of the key, so a re-export in the same package
+/// at a different version still matches.
+fn package_key(symbol: &str) -> Option<(String, String, String)> {
+    let parsed = parse_symbol(symbol).ok()?;
+    let package = parsed.package.as_ref()?;
+    Some((
+        parsed.scheme.clone(),
+        package.manager.clone(),
+        package.name.clone(),
+    ))
+}
 
-    if matches.is_empty() {
-        matches = symbols
-            .iter()
-            .filter(|information| {
-                display_name(information)
-                    .to_lowercase()
-                    .contains(&name_lower)
-            })
-            .map(|information| information.symbol.clone())
-            .collect();
+/// Returns the symbols that match `name` and tells if the match is exact.
+/// An exact match compares the display name, the qualified name, and the
+/// symbol id. If no symbol matches exactly, the function uses a
+/// case-insensitive substring match on the display name.
+fn matched_symbols(index: &SemanticIndex, name: &str) -> (HashSet<String>, bool) {
+    let tables = &index.names;
+    let mut matches = HashSet::new();
+    matches.extend(
+        tables
+            .by_display_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    matches.extend(
+        tables
+            .by_qualified_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    if index.information(name).is_some() {
+        matches.insert(name.to_string());
     }
+    if !matches.is_empty() {
+        return (matches, true);
+    }
+
+    let name_lower = name.to_lowercase();
+    for (display, symbols) in &tables.by_display_name {
+        if display.to_lowercase().contains(&name_lower) {
+            matches.extend(symbols.iter().cloned());
+        }
+    }
+    (matches, false)
+}
+
+pub(crate) fn matching_symbol_ids(index: &SemanticIndex, name: &str) -> MatchingSymbols {
+    let (matches, exact_match) = matched_symbols(index, name);
 
     let mut principals = matches.clone();
     let mut folded_into = HashMap::new();
@@ -339,11 +413,11 @@ pub(crate) fn matching_symbol_ids(index: &SemanticIndex, name: &str) -> Matching
         }
     }
 
-    let mut symbols_by_name: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut symbols_by_name: BTreeMap<&str, Vec<String>> = BTreeMap::new();
     for symbol in &matches {
-        if let Some(information) = index.information(symbol) {
+        if let Some(display) = index.names.display_name_by_symbol.get(symbol) {
             symbols_by_name
-                .entry(display_name(information))
+                .entry(display.as_str())
                 .or_default()
                 .push(symbol.clone());
         }
@@ -359,10 +433,16 @@ pub(crate) fn matching_symbol_ids(index: &SemanticIndex, name: &str) -> Matching
             continue;
         }
         let principal = defined_principals[0].clone();
-        for alias in same_name
-            .into_iter()
-            .filter(|symbol| index.definition_site(symbol).is_none())
-        {
+        // Fold only aliases from the package of the principal. A library
+        // symbol with the same name (for example `str.find`) is a different
+        // symbol and must keep its own references.
+        let principal_package = package_key(&principal);
+        if principal_package.is_none() {
+            continue;
+        }
+        for alias in same_name.into_iter().filter(|symbol| {
+            index.definition_site(symbol).is_none() && package_key(symbol) == principal_package
+        }) {
             principals.remove(&alias);
             folded_into.insert(alias, principal.clone());
         }
@@ -849,5 +929,126 @@ mod tests {
             matches.reference_symbols(DATE_SYMBOL),
             HashSet::from([DATE_SYMBOL.to_string(), DUPLICATE_DATE_SYMBOL.to_string()])
         );
+    }
+
+    const FOREIGN_DATE_SYMBOL: &str = "scip-typescript npm some-lib 2.0.0 lib/Other#formatDate().";
+    const STDLIB_SYMBOL: &str = "scip-python python python-stdlib 3.11 builtins/str#neverUsed().";
+
+    fn fixture_with_foreign_symbols() -> Index {
+        let mut index = fixture(false);
+        for (symbol, name) in [
+            (FOREIGN_DATE_SYMBOL, "formatDate"),
+            (STDLIB_SYMBOL, "neverUsed"),
+            (BARREL_ALIAS_SYMBOL, "formatDate"),
+        ] {
+            index.external_symbols.push(SymbolInformation {
+                symbol: symbol.to_string(),
+                display_name: name.to_string(),
+                ..Default::default()
+            });
+        }
+        let app = index
+            .documents
+            .iter_mut()
+            .find(|document| document.relative_path == "src/app.ts")
+            .expect("app document");
+        app.occurrences
+            .push(legacy_occurrence(FOREIGN_DATE_SYMBOL, 24, false));
+        app.occurrences
+            .push(legacy_occurrence(STDLIB_SYMBOL, 29, false));
+        app.occurrences
+            .push(legacy_occurrence(BARREL_ALIAS_SYMBOL, 34, false));
+        index
+    }
+
+    #[test]
+    fn same_name_symbols_fold_only_within_the_package_of_the_principal() {
+        let index = SemanticIndex::new(fixture_with_foreign_symbols());
+
+        let date = matching_symbol_ids(&index, "formatDate");
+        assert_eq!(
+            date.reference_symbols(DATE_SYMBOL),
+            HashSet::from([DATE_SYMBOL.to_string(), BARREL_ALIAS_SYMBOL.to_string()])
+        );
+        assert!(date.principals.contains(FOREIGN_DATE_SYMBOL));
+
+        let dead = matching_symbol_ids(&index, "neverUsed");
+        assert!(!dead
+            .reference_symbols("scip-typescript npm fixture 1.0.0 dead.ts/neverUsed().")
+            .contains(STDLIB_SYMBOL));
+    }
+
+    /// The name lookup before the name tables existed: a linear scan that
+    /// parses every symbol for every query.
+    fn linear_matched_symbols(index: &SemanticIndex, name: &str) -> (HashSet<String>, bool) {
+        let symbols = index
+            .index()
+            .documents
+            .iter()
+            .flat_map(|document| document.symbols.iter())
+            .chain(index.index().external_symbols.iter())
+            .collect::<Vec<_>>();
+        let exact = symbols
+            .iter()
+            .filter(|information| {
+                display_name(information) == name
+                    || qualified_name(information) == name
+                    || information.symbol == name
+            })
+            .map(|information| information.symbol.clone())
+            .collect::<HashSet<_>>();
+        if !exact.is_empty() {
+            return (exact, true);
+        }
+        let name_lower = name.to_lowercase();
+        let fuzzy = symbols
+            .iter()
+            .filter(|information| {
+                display_name(information)
+                    .to_lowercase()
+                    .contains(&name_lower)
+            })
+            .map(|information| information.symbol.clone())
+            .collect();
+        (fuzzy, false)
+    }
+
+    #[test]
+    fn name_tables_return_the_same_matches_as_the_linear_scan() {
+        let raw = fixture_with_foreign_symbols();
+        let mut queries = raw
+            .documents
+            .iter()
+            .flat_map(|document| document.symbols.iter())
+            .chain(raw.external_symbols.iter())
+            .flat_map(|information| {
+                [
+                    display_name(information),
+                    qualified_name(information),
+                    information.symbol.clone(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        queries.extend(
+            [
+                "format",
+                "FORMATDATE",
+                "rng",
+                "date.ts",
+                "Worker#",
+                "zzz",
+                "*",
+            ]
+            .map(str::to_string),
+        );
+        let index = SemanticIndex::new(raw);
+
+        for query in queries {
+            assert_eq!(
+                matched_symbols(&index, &query),
+                linear_matched_symbols(&index, &query),
+                "query {query}"
+            );
+        }
     }
 }
