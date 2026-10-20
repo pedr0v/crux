@@ -5,15 +5,76 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # The weekly run starts the integration job only.
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # The weekly schedule runs the integration job, not this job.
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The release workflow test job uses the same key, so a tag restores this cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.os }}
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-targets --all-features
+
+  # Cargo.toml declares rust-version 1.85. This job checks that claim.
+  msrv:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+      - run: cargo check --locked --all-targets
+
+  # The real-indexer fixtures download tools and build dependencies.
+  # A failure in this job does not block a merge.
+  integration:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # This step installs the `cs` launcher and a Temurin 17 JDK.
+      - uses: coursier/setup-action@v1
+        with:
+          jvm: temurin:17
+      # The ubuntu-latest image includes Maven and Gradle.
+      - name: Show tool versions
+        run: |
+          go version
+          node --version
+          npx --version
+          java -version
+          cs --version
+          mvn --version
+          gradle --version
+      - run: cargo test --locked --lib -- --ignored

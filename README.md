@@ -43,6 +43,15 @@ Download the binary for your platform from [GitHub Releases](https://github.com/
 | Linux (ARM64) | `crux-aarch64-unknown-linux-gnu` |
 | Windows (x86_64) | `crux-x86_64-pc-windows-msvc.exe` |
 
+Every release also publishes a `SHA256SUMS` file. It lists the SHA-256 hash of each binary.
+To verify a download, put `SHA256SUMS` in the same directory as the binary and run this command:
+
+```sh
+sha256sum --ignore-missing --check SHA256SUMS
+```
+
+On macOS, use `shasum -a 256 --ignore-missing --check SHA256SUMS`.
+
 As an alternative, build crux from source:
 
 ```sh
@@ -61,6 +70,7 @@ crux setup codex
 
 Restart the client after setup. Restart any separate MCP process if the client keeps it running.
 Run `crux self-update --check` to check for an update without installing it.
+Run `crux <subcommand> --help` to print the usage of one subcommand.
 
 ### Ask through MCP
 
@@ -81,6 +91,7 @@ crux architecture .
 ```
 
 The command writes `graph.html`, `GRAPH_REPORT.md`, and `graph.json` to `.crux/architecture`.
+Add `.crux/` to your gitignore file.
 If the default index is missing, the command tries to create it first.
 Install the required [language indexer](#language-support) before automatic indexing.
 
@@ -168,6 +179,20 @@ crux --profile full
 ```
 
 You can also set `CRUX_PROFILE=full`. The `--profile` flag overrides the environment variable. In the full profile, `scip_expand` returns `already expanded`.
+
+## Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `CRUX_PROFILE` | Sets the default tool profile to `slim` or `full`. The `--profile` flag overrides it. |
+| `CRUX_SAVINGS_LEDGER` | Sets the path of the savings ledger file. An unset or empty variable disables the ledger. |
+
+When `CRUX_SAVINGS_LEDGER` is set, the MCP server appends one JSON line to the file after each successful tool call.
+Each line has the fields `ts` (Unix seconds), `tool`, `response_tokens`, and `saved_tokens`.
+Crux estimates `response_tokens` as the response length in bytes divided by four.
+Crux books 80% of `response_tokens` as `saved_tokens`.
+The ledger skips `scip_index`, `scip_architecture`, and `scip_expand` calls, and calls with no saved tokens.
+External tools can read this file to attribute Crux token savings to a session.
 
 ## Tools
 
@@ -270,7 +295,8 @@ Set `discover_depth` to control the search depth. Set it to `0` to search only t
 A directory that owns a language hides markers for the same language below it.
 Crux skips hidden directories, `node_modules`, `target`, `dist`, `build`, `out`, `vendor`, `venv`, and `__pycache__`.
 
-crux writes the index to `<project>/.scip-nav/index.scip`. Add `.scip-nav/` to your global gitignore file.
+crux writes the index to `<project>/.scip-nav/index.scip`. Add `.scip-nav/` and `.crux/` to your global gitignore file.
+The `.crux/` directory holds the output of `crux architecture`.
 
 ### Prepare an index before an agent starts
 
@@ -298,6 +324,17 @@ fi
 The caller installs the validated index in `.scip-nav` for MCP queries.
 Add `.scip-nav/` to the checkout's ignore rules before preparation.
 The `check --index` command rejects malformed indexes and indexes without documents or symbols.
+
+To check the default index of a project, pass the project root:
+
+```sh
+crux check /absolute/path/to/project
+```
+
+The project root must be an absolute path.
+The command reads `<project-root>/.scip-nav/index.scip` and prints the document, symbol, and occurrence counts.
+It exits with a nonzero code when the index is missing or malformed.
+When the index has no documents or no symbols, it prints a warning and exits with code 0.
 
 Preparation supports `--language`, `--discover-depth` (default 3), and `--min-index-bytes` (default 100).
 Crux validates every selected index before it publishes the merged index.
@@ -333,6 +370,8 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
 ```
 
+CI runs these commands on Linux, macOS, and Windows.
+
 Real indexer fixtures are separate because they download tools and build dependencies.
 With Go 1.25+, Node.js/npx, JDK 17+, Coursier (`cs`), Maven, and Gradle on `PATH`, run:
 
@@ -340,8 +379,21 @@ With Go 1.25+, Node.js/npx, JDK 17+, Coursier (`cs`), Maven, and Gradle on `PATH
 cargo test --locked --lib -- --ignored
 ```
 
+A weekly CI job runs these fixtures. The job does not block merges.
 These fixtures cover Maven with Apache RAT, Gradle included-build filtering, a Go workspace, and nested/inferred TypeScript configs.
 The CLI suite also checks cache reuse, revision and toolchain invalidation, failed preparation, and the model-start gate.
+
+### Benchmark harness
+
+The benchmark harness is not part of this repository.
+It lives in [crux-bench](https://github.com/pedr0v/crux-bench).
+To run it, clone that repository into `swebench-harness/` at the root of this checkout:
+
+```sh
+git clone https://github.com/pedr0v/crux-bench swebench-harness
+```
+
+The root `.gitignore` excludes `/swebench-harness/`, so Git does not track the clone.
 
 ## Benchmark
 

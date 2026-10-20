@@ -896,7 +896,6 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    #[cfg(unix)]
     fn fixture_runtime() -> Option<(String, PathBuf)> {
         Some(("17.0.12".to_string(), PathBuf::from("/fixture/jdk")))
     }

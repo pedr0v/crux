@@ -9,7 +9,33 @@ permissions:
   contents: write
 
 jobs:
+  # A tag from a red commit must not ship binaries.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      # This key matches the CI job on ubuntu-latest, so a tag restores the CI cache.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-ubuntu-latest
+      - name: Check that the release notes exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="doc/releases/${GITHUB_REF_NAME}.md"
+          [[ -f "$notes" ]] || {
+            echo "Missing release notes: $notes"
+            exit 1
+          }
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-targets --all-features
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
@@ -40,6 +66,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # A tag run cannot share a cache with a later tag, so do not save one.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          save-if: false
       - name: Install Linux ARM64 cross-compiler
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu qemu-user
@@ -81,11 +112,25 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # The release step reads the release notes from the repository.
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
           pattern: crux-*
           merge-multiple: true
+      # Each line has the sha256sum format: <hex hash>, two spaces, <file name>.
+      # The `crux self-update` command expects an asset named exactly SHA256SUMS.
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum crux-* > SHA256SUMS
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/crux-*
+          body_path: doc/releases/${{ github.ref_name }}.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/crux-*
+            dist/SHA256SUMS

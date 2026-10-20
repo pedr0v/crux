@@ -1,2 +1,4 @@
 target/
 .scip-nav/
+.crux/
+/swebench-harness/

@@ -64,21 +64,27 @@ Run this command:
 cargo test --locked --test architecture_navigation_eval -- --nocapture
 ```
 
+The fixture is a hand-built SCIP index with four documents.
+The documents are `src/api.rs`, `src/service.rs`, `src/database.rs`, and `src/isolated.rs`.
+Each document defines one function and has at most three lines.
 The fixture has four modules and three directed dependencies.
 It has one two-module cycle and one isolated module.
 The test checks output against this fixture truth.
 
-This table records one local run on 2026-09-28:
+The test prints one line that starts with `ARCHITECTURE_NAVIGATION_EVAL=`.
+This line holds every measurement as JSON.
+The test does not store the line. Copy it from the test output when you need it.
 
-| Path | Calls | Output bytes | Correctness result | Observed latency |
-| --- | ---: | ---: | --- | ---: |
-| Architecture overview | 1 | 1,215 | Reported all four fixture counts | 407,861 us |
-| Scoped architecture | 1 | 901 | Reported three direct edges and the relevant cycle | 561 us |
-| Scripted four-outline and one-map baseline | 5 | 709 | Supplied evidence for manual dependency and cycle inference | Not recorded |
+This table records one local run on 2026-10-20:
 
-Nine extra cached scoped calls had a median latency of 410 us.
-The first overview can include server startup, index loading, and projection construction.
-Latency depends on the machine and file cache.
+| Path | Calls | Output bytes | Correctness result |
+| --- | ---: | ---: | --- |
+| Architecture overview | 1 | 1,215 | Reported all four fixture counts |
+| Scoped architecture | 1 | 901 | Reported three direct edges and the relevant cycle |
+| Scripted four-outline and one-map baseline | 5 | 709 | Supplied evidence for manual dependency and cycle inference |
+
+The test asserts the correctness results. It does not assert the exact byte counts.
+The byte counts were the same in the runs of 2026-09-28 and 2026-10-20.
 The baseline call count describes one script.
 It does not establish the minimum call count for existing tools.
 
@@ -90,6 +96,8 @@ Output bytes measure returned UTF-8 text.
 They are not token measurements.
 The evaluation does not claim agent savings from payload size.
 It excludes `scip_architecture` from the existing savings ledger.
+
+### Routing controls
 
 The test checks server guidance for three negative routing controls:
 
@@ -103,6 +111,31 @@ The test asserts the initialize guidance and relevant tool descriptions.
 These checks verify the server routing contract.
 They do not execute a model or measure live model choices.
 A paired model evaluation must test adoption and task cost separately.
+
+### Latency
+
+The test measures latency but does not assert it.
+Latency depends on the machine, the toolchain, and the file cache.
+The first overview call loads the index and builds the architecture projection.
+Later calls reuse the cached projection.
+
+This run of 2026-10-20 used this environment:
+
+- Machine: Apple M4 Pro, macOS 26.1 (arm64).
+- Toolchain: rustc 1.97.1 and cargo 1.97.1.
+- Build profile: the default `cargo test` profile, unoptimized with debug information.
+- Fixture: the four-document fixture in this section.
+
+| Call | Latency |
+| --- | ---: |
+| First architecture overview | 1,719 us |
+| First scoped architecture | 340 us |
+| Median of nine repeated scoped calls | 184 us |
+
+An earlier run of 2026-09-28 recorded 407,861 us for the first overview and 561 us for the first scoped call.
+The ratio between these two calls was about 700 in that run and about 5 in the run above.
+Thus a single latency value does not support a comparison.
+Do not use these values as a performance claim.
 
 ## Limits
 
