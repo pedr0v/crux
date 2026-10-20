@@ -18,9 +18,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
+/// The server echoes a requested protocol version only from this list.
+/// Any other request gets DEFAULT_PROTOCOL_VERSION.
+/// The server is tools-only over stdio and accepts JSON-RPC batches.
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+/// The answer to an unknown version. The MCP lifecycle says: answer with
+/// the latest version the server supports.
+const LATEST_PROTOCOL_VERSION: &str = "2025-06-18";
 const FULL_INSTRUCTIONS: &str = "Use scip_architecture once for explicit architecture questions, module or package dependencies, cycles, or unclear scope before a change across files. Pass a known project-relative file or directory as scope. Reuse relevant architecture results until the index changes. Use scip_map for named-symbol references and callers. Use scip_outline for one file's symbols. Use scip_find for fragments or unreferenced audits. Prefer rg for simple text or definition search. Do not require architecture before every edit or symbol query. If a Crux result is empty, use repository-native search and stop equivalent retries. If a scip_map section is truncated, call it once more with ref_limit=200. If the index is missing or stale, call scip_index once. Make at most two index calls before answering.";
 const SLIM_INSTRUCTIONS: &str = "Use scip_architecture once for explicit architecture questions, module or package dependencies, cycles, or unclear scope before a change across files. Pass a known project-relative file or directory as scope. Reuse relevant architecture results until the index changes. Use scip_map for named-symbol references and callers. Use scip_outline for one file's symbols. Use scip_find for fragments or unreferenced audits. Prefer rg for simple text or definition search. Do not require architecture before every edit or symbol query. If a Crux result is empty, use repository-native search and stop equivalent retries. If a scip_map section is truncated, call it once more with ref_limit=200. If the index is missing or stale, call scip_index once. Make at most two index calls before answering. Need finer-grained tools? Call scip_expand.";
 const EXPANDED_TOOLS: &str = "expanded: scip_search, scip_def, scip_refs, scip_callers, scip_dead";
+/// scip_index accepts these language names. index.rs parses the same list.
+const INDEX_LANGUAGES: &[&str] = &["typescript", "python", "rust", "dart", "java", "cpp", "go"];
 const DEFAULT_FIND_LIMIT: usize = 20;
 const DEFAULT_MAP_REF_LIMIT: usize = 20;
 const DEFAULT_NARROW_REFS_LIMIT: usize = 50;
@@ -35,6 +44,17 @@ const DEFAULT_OUTLINE_LIMIT: usize = 38;
 const DEFAULT_ARCHITECTURE_LIMIT: usize = 20;
 pub(crate) const MAX_LIMIT: usize = 200;
 const MAX_CALLER_DEPTH: usize = 3;
+/// Subcommands that print their own usage for `--help` or `-h`.
+const SUBCOMMANDS: &[&str] = &[
+    "architecture",
+    "prepare",
+    "census",
+    "capabilities",
+    "check",
+    "self-update",
+    "setup",
+    "unsetup",
+];
 const HELP_TEXT: &str = "Usage:\n  crux architecture [project-dir] [--index <file>] [--output <directory>]\n  crux prepare --repo <dir> --output <external-index> [--format json]\n  crux census --repo <dir> [--format json]\n  crux capabilities\n  crux check --index <file>\n  crux [--profile slim|full]\n  crux [--profile slim|full] --version\n  crux self-update [--check]\n  crux check <absolute-project-root>\n  crux setup <codex|claude> [--project <dir>]\n  crux unsetup <codex|claude> [--project <dir>]";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -334,9 +354,18 @@ impl SavingsLedger {
         else {
             return;
         };
-        use std::io::Write as _;
-        let _ = writeln!(file, "{line}");
+        let _ = append_line(&mut file, line);
     }
+}
+
+/// Writes one JSON line with one write_all call.
+/// A file opened with O_APPEND then gets one write(2) for the full line.
+/// On a local file system, concurrent servers that share the ledger do
+/// not interleave parts of a line.
+fn append_line(writer: &mut impl Write, line: String) -> io::Result<()> {
+    let mut record = line;
+    record.push('\n');
+    writer.write_all(record.as_bytes())
 }
 
 impl Default for Server {
@@ -522,6 +551,25 @@ impl Server {
                 ))
             }
         };
+        let Value::Array(batch) = &request else {
+            return self.dispatch_value(&request);
+        };
+        if batch.is_empty() {
+            return Some(rpc_error(Value::Null, -32600, "invalid request"));
+        }
+        // JSON-RPC 2.0 sends one array of responses for a batch.
+        // A batch of notifications only gets no output.
+        let responses = batch
+            .iter()
+            .filter_map(|item| self.dispatch_value(item))
+            .collect::<Vec<_>>();
+        (!responses.is_empty()).then(|| format!("[{}]", responses.join(",")))
+    }
+
+    fn dispatch_value(&mut self, request: &Value) -> Option<String> {
+        if !request.is_object() {
+            return Some(rpc_error(Value::Null, -32600, "invalid request"));
+        }
         let has_id = request.get("id").is_some();
         let id = request.get("id").cloned().unwrap_or(Value::Null);
         let Some(method) = request.get("method").and_then(Value::as_str) else {
@@ -534,10 +582,14 @@ impl Server {
 
         let response = match method {
             "initialize" => {
-                let protocol_version = request
+                let protocol_version = match request
                     .pointer("/params/protocolVersion")
                     .and_then(Value::as_str)
-                    .unwrap_or(DEFAULT_PROTOCOL_VERSION);
+                {
+                    Some(version) if SUPPORTED_PROTOCOL_VERSIONS.contains(&version) => version,
+                    Some(_) => LATEST_PROTOCOL_VERSION,
+                    None => DEFAULT_PROTOCOL_VERSION,
+                };
                 rpc_success(
                     id,
                     json!({
@@ -561,8 +613,9 @@ impl Server {
                     .cloned()
                     .unwrap_or_else(|| json!({}));
                 let result = self.call_tool(name, &arguments);
-                // scip_index is a build step, not an answer; recording it
-                // would book savings for work the agent never avoided.
+                // scip_index is a build step and scip_expand only shows more
+                // tools. They are not answers. A ledger line for them books
+                // savings for work the agent never avoided.
                 if !result.is_error && savings_eligible(name) {
                     if let Some(ledger) = &self.savings_ledger {
                         ledger.record(name, &result.text);
@@ -587,7 +640,7 @@ impl Server {
 }
 
 fn savings_eligible(tool: &str) -> bool {
-    !matches!(tool, "scip_index" | "scip_architecture")
+    !matches!(tool, "scip_index" | "scip_architecture" | "scip_expand")
 }
 
 fn rpc_success(id: Value, result: Value) -> String {
@@ -619,7 +672,7 @@ fn slim_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "scip_index",
-            "description": "Builds or refreshes a project code index after another tool reports a missing index.",
+            "description": "Builds or refreshes the code index when another tool reports a missing index.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -628,20 +681,19 @@ fn slim_tool_definitions() -> Vec<Value> {
                     },
                     "language": {
                         "type": "string",
-                        "description": "One language name."
+                        "enum": INDEX_LANGUAGES
                     },
                     "languages": {
                         "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Language name list."
+                        "items": {"type": "string", "enum": INDEX_LANGUAGES}
                     },
                     "max_file_mb": {
                         "type": "integer",
-                        "description": "TypeScript MB limit."
+                        "description": "Skip TypeScript files over this many MB."
                     },
                     "discover_depth": {
                         "type": "integer",
-                        "description": "Max depth sub-project discovery. 0 = root only. Default 3."
+                        "description": "Sub-project discovery depth. 0 = root only. Default 3."
                     }
                 }),
                 required_fields("scip_index")
@@ -649,7 +701,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_architecture",
-            "description": "Shows SCIP-derived module and package architecture. Use once for explicit architecture, dependency, cycle, or unclear multi-file scope questions. Pass a known project-relative scope. Do not use for named symbols or simple text search.",
+            "description": "Shows module and package architecture. Use once for explicit architecture, dependency, cycle, or unclear multi-file scope questions. Pass a known project-relative scope. Do not use for named symbols or text search.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -658,7 +710,7 @@ fn slim_tool_definitions() -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Optional project-relative file or directory."
+                        "description": "Project-relative file or directory."
                     },
                     "direction": {
                         "type": "string",
@@ -684,7 +736,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_find",
-            "description": "Answers 'which symbol matches this name or fragment?' — use to find or disambiguate symbols; set unreferenced=true to list dead symbols.",
+            "description": "Finds or disambiguates symbols by name or fragment. Set unreferenced=true to list dead symbols.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -697,16 +749,17 @@ fn slim_tool_definitions() -> Vec<Value> {
                     },
                     "limit": {
                         "type": "integer",
+                        "default": DEFAULT_FIND_LIMIT,
+                        "minimum": 1,
+                        "maximum": MAX_LIMIT,
                         "description": "Candidate limit."
                     },
                     "offset": {
                         "type": "integer",
-                        "minimum": 0
+                        "minimum": 0,
+                        "description": "Candidate offset."
                     },
-                    "unreferenced": {
-                        "type": "boolean",
-                        "description": "Require no inbound references."
-                    }
+                    "unreferenced": {"type": "boolean"}
                 }),
                 required_fields("scip_find")
             )
@@ -725,16 +778,19 @@ fn slim_tool_definitions() -> Vec<Value> {
                         "items": {"type": "string"},
                         "minItems": 1,
                         "maxItems": MAX_MAP_NAMES,
-                        "description": "Symbol names, bare or qualified, up to eight."
+                        "description": "Bare or qualified symbol names."
                     },
                     "ref_limit": {
                         "type": "integer",
                         "default": DEFAULT_MAP_REF_LIMIT,
+                        "minimum": 1,
+                        "maximum": MAX_LIMIT,
                         "description": "Per-symbol reference and caller limit."
                     },
                     "offset": {
                         "type": "integer",
-                        "minimum": 0
+                        "minimum": 0,
+                        "description": "Per-symbol result offset."
                     }
                 }),
                 required_fields("scip_map")
@@ -742,7 +798,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_outline",
-            "description": "Answers 'what symbols are defined in this file?' — use for file structure at a glance.",
+            "description": "Lists which symbols are defined in this file.",
             "inputSchema": object_schema(
                 json!({
                     "project_root": {
@@ -761,7 +817,8 @@ fn slim_tool_definitions() -> Vec<Value> {
                     },
                     "offset": {
                         "type": "integer",
-                        "minimum": 0
+                        "minimum": 0,
+                        "description": "Symbol offset."
                     }
                 }),
                 required_fields("scip_outline")
@@ -769,7 +826,7 @@ fn slim_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_expand",
-            "description": "Need finer-grained search, definition, references, callers, or dead-code tools? Call this to reveal them.",
+            "description": "Reveals finer-grained search, definition, reference, caller, and dead-code tools.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -782,12 +839,12 @@ fn narrow_tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "scip_search",
-            "description": "Search symbol display names and return disambiguated definition locations.",
-            "inputSchema": narrow_object_schema(
+            "description": "Searches symbol display names for disambiguated definition locations.",
+            "inputSchema": object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
-                        "description": "Absolute project path"
+                        "description": "Absolute root."
                     },
                     "query": {"type": "string"},
                     "limit": {
@@ -803,11 +860,11 @@ fn narrow_tool_definitions() -> Vec<Value> {
         json!({
             "name": "scip_def",
             "description": "Find definition sites with signatures and source lines for one name; prefer scip_map for multi-symbol navigation.",
-            "inputSchema": narrow_object_schema(
+            "inputSchema": object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
-                        "description": "Absolute project path"
+                        "description": "Absolute root."
                     },
                     "name": {"type": "string"}
                 }),
@@ -817,11 +874,11 @@ fn narrow_tool_definitions() -> Vec<Value> {
         json!({
             "name": "scip_refs",
             "description": "Find reference lines grouped by file for one name; prefer scip_map for source context.",
-            "inputSchema": narrow_object_schema(
+            "inputSchema": object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
-                        "description": "Absolute project path"
+                        "description": "Absolute root."
                     },
                     "name": {"type": "string"},
                     "limit": {
@@ -832,7 +889,8 @@ fn narrow_tool_definitions() -> Vec<Value> {
                     },
                     "offset": {
                         "type": "integer",
-                        "minimum": 0
+                        "minimum": 0,
+                        "description": "Reference offset."
                     }
                 }),
                 required_fields("scip_refs")
@@ -840,12 +898,12 @@ fn narrow_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_callers",
-            "description": "who calls X (transitive) — resolve references to their enclosing functions or module",
-            "inputSchema": narrow_object_schema(
+            "description": "Finds transitive callers of one name as their enclosing functions or modules.",
+            "inputSchema": object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
-                        "description": "Absolute project path"
+                        "description": "Absolute root."
                     },
                     "name": {"type": "string"},
                     "depth": {
@@ -866,16 +924,16 @@ fn narrow_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "scip_dead",
-            "description": "find exports nothing uses — audit before deleting; separates fully unused from file-local symbols",
-            "inputSchema": narrow_object_schema(
+            "description": "Finds unused exports for an audit before deletion. It separates fully unused from file-local symbols.",
+            "inputSchema": object_schema(
                 json!({
                     "project_root": {
                         "type": "string",
-                        "description": "Absolute project path"
+                        "description": "Absolute root."
                     },
                     "path_prefix": {
                         "type": "string",
-                        "description": "Optional project-relative path prefix"
+                        "description": "Project-relative path prefix."
                     },
                     "limit": {
                         "type": "integer",
@@ -886,7 +944,7 @@ fn narrow_tool_definitions() -> Vec<Value> {
                     "exports_only": {
                         "type": "boolean",
                         "default": true,
-                        "description": "Only report top-level exported declarations"
+                        "description": "Only top-level exported declarations."
                     }
                 }),
                 required_fields("scip_dead")
@@ -895,15 +953,9 @@ fn narrow_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// Every argument struct denies unknown fields.
+/// The schema tells clients the same rule.
 fn object_schema(properties: Value, required: &[&str]) -> Value {
-    json!({
-        "type": "object",
-        "properties": properties,
-        "required": required
-    })
-}
-
-fn narrow_object_schema(properties: Value, required: &[&str]) -> Value {
     json!({
         "type": "object",
         "properties": properties,
@@ -975,8 +1027,50 @@ fn resolve_profile(
     Ok((profile, remaining))
 }
 
+/// Returns the usage lines of HELP_TEXT for one known subcommand.
+fn subcommand_usage(command: &str) -> Option<String> {
+    if !SUBCOMMANDS.contains(&command) {
+        return None;
+    }
+    let prefix = format!("  crux {command}");
+    let lines = HELP_TEXT
+        .lines()
+        .filter(|line| {
+            line.strip_prefix(&prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+        .collect::<Vec<_>>();
+    Some(format!("Usage:\n{}", lines.join("\n")))
+}
+
+/// Finds a `--help` or `-h` flag after a known subcommand.
+/// The flag wins over all other subcommand arguments.
+fn requested_subcommand_help(arguments: &[String]) -> Option<&str> {
+    let (command, rest) = arguments.split_first()?;
+    if !SUBCOMMANDS.contains(&command.as_str()) {
+        return None;
+    }
+    rest.iter()
+        .any(|argument| argument == "--help" || argument == "-h")
+        .then_some(command.as_str())
+}
+
+fn print_subcommand_help(command: &str) -> Result<()> {
+    if command == "architecture" {
+        // The architecture module owns its detailed usage text.
+        return crate::architecture::run(&["--help".to_string()]);
+    }
+    let usage = subcommand_usage(command).context("known subcommand has usage text")?;
+    println!("{usage}");
+    Ok(())
+}
+
 pub fn run() -> Result<()> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
+    // Subcommand help does not run the subcommand or read the MCP profile.
+    if let Some(command) = requested_subcommand_help(&arguments) {
+        return print_subcommand_help(command);
+    }
     // Standalone commands do not use the MCP profile setting.
     if arguments
         .first()
@@ -992,6 +1086,9 @@ pub fn run() -> Result<()> {
     }
     let environment_profile = env::var("CRUX_PROFILE").ok();
     let (profile, arguments) = resolve_profile(arguments, environment_profile.as_deref())?;
+    if let Some(command) = requested_subcommand_help(&arguments) {
+        return print_subcommand_help(command);
+    }
     match arguments.as_slice() {
         [command, arguments @ ..] if command == "architecture" => {
             crate::architecture::run(arguments)
@@ -1087,6 +1184,7 @@ mod tests {
         assert!(savings_eligible("scip_map"));
         assert!(!savings_eligible("scip_index"));
         assert!(!savings_eligible("scip_architecture"));
+        assert!(!savings_eligible("scip_expand"));
     }
 
     #[test]
@@ -1555,6 +1653,8 @@ mod tests {
         let full = rpc_success(json!(1), json!({"tools": tool_definitions(true)}));
 
         // The compact schemas keep the persistent tool list small.
+        // The margin is small: 4 bytes in slim and 11 bytes in full.
+        // Trim a description before you add a schema field.
         assert!(
             slim.len() <= 3_500,
             "slim tools/list JSON is {} characters",
@@ -1778,5 +1878,254 @@ mod tests {
             assert!(result.is_error);
             assert_eq!(result.text, format!("unknown tool: {name}"));
         }
+    }
+
+    fn dispatch_json(server: &mut Server, line: &str) -> Value {
+        let response = server.dispatch_line(line).expect("response line");
+        serde_json::from_str(&response).expect("valid response json")
+    }
+
+    #[test]
+    fn initialize_answers_only_a_supported_protocol_version() {
+        let mut server = Server::default();
+        for (requested, expected) in [
+            (json!("9999-01-01"), "2025-06-18"),
+            (json!("2024-11-05"), "2024-11-05"),
+            (json!("2025-03-26"), "2025-03-26"),
+            (json!("2025-06-18"), "2025-06-18"),
+            (json!(20241105), "2024-11-05"),
+            (Value::Null, "2024-11-05"),
+        ] {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": requested, "capabilities": {}}
+            });
+            let response = dispatch_json(&mut server, &request.to_string());
+            assert_eq!(
+                response.pointer("/result/protocolVersion"),
+                Some(&json!(expected)),
+                "requested {requested}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_rpc_batch_returns_one_array_and_skips_notifications() {
+        let mut server = Server::default();
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "ping"},
+            42
+        ]);
+        let response = dispatch_json(&mut server, &batch.to_string());
+        let responses = response.as_array().expect("batch response array");
+        assert_eq!(responses.len(), 3);
+        assert_eq!(responses[0]["id"], json!(1));
+        assert!(responses[0].pointer("/result/tools").is_some());
+        assert_eq!(responses[1]["id"], json!(2));
+        assert_eq!(responses[1]["result"], json!({}));
+        assert_eq!(responses[2]["id"], Value::Null);
+        assert_eq!(responses[2].pointer("/error/code"), Some(&json!(-32600)));
+
+        let notifications = json!([
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "method": "unknown-notification"}
+        ]);
+        assert!(server.dispatch_line(&notifications.to_string()).is_none());
+    }
+
+    #[test]
+    fn json_rpc_rejects_empty_batches_and_non_object_requests() {
+        let mut server = Server::default();
+        for line in ["[]", "42", "null", "\"x\"", "true"] {
+            let response = dispatch_json(&mut server, line);
+            assert_eq!(response["id"], Value::Null, "{line}");
+            assert_eq!(
+                response.pointer("/error/code"),
+                Some(&json!(-32600)),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_rpc_reports_parse_errors_missing_tool_names_and_answers_ping() {
+        let mut server = Server::default();
+        let response = dispatch_json(&mut server, "{\"jsonrpc\": \"2.0\", \"id\": 1,");
+        assert_eq!(response["id"], Value::Null);
+        assert_eq!(response.pointer("/error/code"), Some(&json!(-32700)));
+
+        let response = dispatch_json(
+            &mut server,
+            &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}}).to_string(),
+        );
+        assert_eq!(response["id"], json!(2));
+        assert_eq!(response.pointer("/error/code"), Some(&json!(-32602)));
+        assert_eq!(
+            response.pointer("/error/message"),
+            Some(&json!("missing tool name"))
+        );
+
+        let response = dispatch_json(
+            &mut server,
+            &json!({"jsonrpc": "2.0", "id": 3, "method": "ping"}).to_string(),
+        );
+        assert_eq!(response["id"], json!(3));
+        assert_eq!(response["result"], json!({}));
+    }
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.writes.push(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn savings_ledger_line_uses_one_write_call() {
+        let mut writer = RecordingWriter::default();
+        append_line(&mut writer, "{\"a\":1}".to_string()).expect("append line");
+        assert_eq!(writer.writes, vec![b"{\"a\":1}\n".to_vec()]);
+    }
+
+    #[test]
+    fn scip_expand_does_not_book_savings() {
+        let project = TestProject::new();
+        let ledger_path = project.root.join("ledger/savings.jsonl");
+        let mut server = Server::new(Profile::Slim);
+        server.savings_ledger = Some(SavingsLedger {
+            path: ledger_path.clone(),
+        });
+        let request = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "scip_expand", "arguments": {}}
+        })
+        .to_string();
+        for _ in 0..2 {
+            let response = dispatch_json(&mut server, &request);
+            assert_eq!(response.pointer("/result/isError"), Some(&json!(false)));
+        }
+        assert!(!ledger_path.exists());
+    }
+
+    #[test]
+    fn tool_schemas_reject_unknown_fields_and_describe_inputs() {
+        for tool in tool_definitions(true) {
+            let name = tool["name"].as_str().expect("tool name");
+            let schema = &tool["inputSchema"];
+            let properties = schema["properties"].as_object().expect("properties");
+            if properties.is_empty() {
+                continue;
+            }
+            assert_eq!(schema["additionalProperties"], json!(false), "{name}");
+            assert_eq!(
+                properties["project_root"]["description"],
+                json!("Absolute root."),
+                "{name}"
+            );
+            for (field, property) in properties {
+                if field == "limit" || field == "ref_limit" {
+                    assert!(property.get("default").is_some(), "{name}.{field}");
+                    assert_eq!(property["minimum"], json!(1), "{name}.{field}");
+                    assert_eq!(property["maximum"], json!(MAX_LIMIT), "{name}.{field}");
+                }
+                if field == "offset" {
+                    assert!(property["description"].is_string(), "{name}.{field}");
+                }
+            }
+            let description = tool["description"].as_str().expect("tool description");
+            assert!(
+                description.starts_with(|first: char| first.is_uppercase()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn scip_index_schema_lists_every_parsed_language() {
+        let tools = tool_definitions(false);
+        let index = tools
+            .iter()
+            .find(|tool| tool["name"] == "scip_index")
+            .expect("scip_index tool");
+        let properties = &index["inputSchema"]["properties"];
+        assert_eq!(properties["language"]["enum"], json!(INDEX_LANGUAGES));
+        assert_eq!(
+            properties["languages"]["items"]["enum"],
+            json!(INDEX_LANGUAGES)
+        );
+
+        let project = TestProject::new();
+        let result = Server::default().call_tool(
+            "scip_index",
+            &json!({"project_root": project.root, "languages": ["notalanguage"]}),
+        );
+        assert!(result.is_error);
+        assert!(
+            result
+                .text
+                .ends_with(&format!("(expected {})", INDEX_LANGUAGES.join("|"))),
+            "{}",
+            result.text
+        );
+    }
+
+    #[test]
+    fn subcommand_help_flags_select_the_subcommand_usage() {
+        let arguments = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            requested_subcommand_help(&arguments(&["prepare", "--help"])),
+            Some("prepare")
+        );
+        assert_eq!(
+            requested_subcommand_help(&arguments(&["setup", "claude", "-h"])),
+            Some("setup")
+        );
+        assert_eq!(requested_subcommand_help(&arguments(&["--help"])), None);
+        assert_eq!(
+            requested_subcommand_help(&arguments(&["unknown", "--help"])),
+            None
+        );
+        assert_eq!(
+            requested_subcommand_help(&arguments(&["check", "/tmp/project"])),
+            None
+        );
+
+        for command in SUBCOMMANDS {
+            let usage = subcommand_usage(command).expect("usage text");
+            let lines = usage.lines().collect::<Vec<_>>();
+            assert_eq!(lines[0], "Usage:");
+            assert!(lines.len() > 1, "{command}");
+            for line in &lines[1..] {
+                assert!(line.starts_with(&format!("  crux {command}")), "{line}");
+            }
+        }
+        assert_eq!(
+            subcommand_usage("check").expect("check usage"),
+            "Usage:\n  crux check --index <file>\n  crux check <absolute-project-root>"
+        );
+        assert_eq!(
+            subcommand_usage("setup").expect("setup usage"),
+            "Usage:\n  crux setup <codex|claude> [--project <dir>]"
+        );
     }
 }
