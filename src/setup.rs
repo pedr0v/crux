@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::prepare::atomic_write_preserving;
+
 const BEGIN_MARKER: &str = "# --- crux begin ---";
 const END_MARKER: &str = "# --- crux end ---";
 const ADOPTION_BODY: &str = "## crux code index\n\nThis project may have a crux code index.\n\nUse `scip_architecture` once for explicit architecture questions, module or package dependencies, cycles, or unclear scope before a change across files. Pass a known project-relative file or directory as `scope`. Reuse relevant results until the index changes. Use `scip_map` for named-symbol references and callers. Use `scip_outline` for one file's symbols. Use `scip_find` for fragments or unreferenced audits. Prefer `rg` for simple text or definition search. Do not require architecture before every edit or symbol query. If a Crux result is empty, use repository-native search and stop equivalent retries.";
@@ -87,64 +89,73 @@ pub(crate) fn parse_client_arguments(arguments: &[String]) -> Result<(Client, Op
 pub(crate) fn run_setup(client: Client, project: Option<&Path>) -> Result<()> {
     let home = home_dir()?;
     let current_exe = env::current_exe().context("find the current executable")?;
+    let instructions = instruction_path(&home, project, client);
     match client {
-        Client::Codex => setup_codex(&home, project, &current_exe),
-        Client::Claude => setup_claude(&home, project, &current_exe),
+        Client::Codex => setup_codex(
+            &codex_config_path(&home, env::var_os("CODEX_HOME")),
+            &instructions,
+            &current_exe,
+        ),
+        Client::Claude => setup_claude(&instructions, &current_exe, &claude_programs()),
     }
 }
 
 pub(crate) fn run_unsetup(client: Client, project: Option<&Path>) -> Result<()> {
     let home = home_dir()?;
+    let instructions = instruction_path(&home, project, client);
     match client {
-        Client::Codex => unsetup_codex(&home, project),
-        Client::Claude => unsetup_claude(&home, project),
+        Client::Codex => unsetup_codex(
+            &codex_config_path(&home, env::var_os("CODEX_HOME")),
+            &instructions,
+        ),
+        Client::Claude => unsetup_claude(&instructions, &claude_programs()),
     }
 }
 
 fn home_dir() -> Result<PathBuf> {
-    env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .or_else(|| env::var_os("USERPROFILE").filter(|value| !value.is_empty()))
-        .map(PathBuf::from)
+    home_from(env::var_os("HOME"), env::var_os("USERPROFILE"))
         .context("find the user home directory")
 }
 
-fn setup_codex(home: &Path, project: Option<&Path>, current_exe: &Path) -> Result<()> {
-    let config = codex_config_path(home);
-    let report = edit_file(&config, |content| {
-        install_codex_config(content, current_exe)
-    })?;
-    print_edit(&config, &report, "configured the crux MCP server");
+fn home_from(home: Option<OsString>, user_profile: Option<OsString>) -> Option<PathBuf> {
+    home.filter(|value| !value.is_empty())
+        .or_else(|| user_profile.filter(|value| !value.is_empty()))
+        .map(PathBuf::from)
+}
 
-    let instructions = instruction_path(home, project, Client::Codex);
-    let report = edit_file(&instructions, |content| {
+fn setup_codex(config: &Path, instructions: &Path, current_exe: &Path) -> Result<()> {
+    let report = edit_file(config, |content| install_codex_config(content, current_exe))?;
+    print_edit(config, &report, "configured the crux MCP server");
+
+    let report = edit_file(instructions, |content| {
         insert_or_replace(content, ADOPTION_BODY)
     })?;
-    print_edit(&instructions, &report, "installed crux code index guidance");
+    print_edit(instructions, &report, "installed crux code index guidance");
     Ok(())
 }
 
-fn unsetup_codex(home: &Path, project: Option<&Path>) -> Result<()> {
-    let config = codex_config_path(home);
-    let report = edit_file(&config, remove_marker_block)?;
-    print_removal(&config, &report, "crux MCP server configuration");
+fn unsetup_codex(config: &Path, instructions: &Path) -> Result<()> {
+    let report = edit_file(config, remove_marker_block)?;
+    print_removal(config, &report, "crux MCP server configuration");
 
-    let instructions = instruction_path(home, project, Client::Codex);
-    let report = edit_file(&instructions, remove_marker_block)?;
-    print_removal(&instructions, &report, "crux code index guidance");
+    let report = edit_file(instructions, remove_marker_block)?;
+    print_removal(instructions, &report, "crux code index guidance");
     Ok(())
 }
 
-fn setup_claude(home: &Path, project: Option<&Path>, current_exe: &Path) -> Result<()> {
-    match run_claude(&[
-        OsString::from("mcp"),
-        OsString::from("add"),
-        OsString::from("--scope"),
-        OsString::from("user"),
-        OsString::from("crux"),
-        OsString::from("--"),
-        current_exe.as_os_str().to_os_string(),
-    ])? {
+fn setup_claude(instructions: &Path, current_exe: &Path, programs: &[OsString]) -> Result<()> {
+    match run_claude(
+        programs,
+        &[
+            OsString::from("mcp"),
+            OsString::from("add"),
+            OsString::from("--scope"),
+            OsString::from("user"),
+            OsString::from("crux"),
+            OsString::from("--"),
+            current_exe.as_os_str().to_os_string(),
+        ],
+    )? {
         ClaudeCommand::Absent => println!(
             "Claude CLI not found. Run: claude mcp add --scope user crux -- {}",
             shell_quote(current_exe)
@@ -153,29 +164,32 @@ fn setup_claude(home: &Path, project: Option<&Path>, current_exe: &Path) -> Resu
             println!("Registered the crux MCP server with Claude Code.");
         }
         ClaudeCommand::Ran(output) if output_reports_existing_server(&output) => {
-            println!("No change to the Claude Code crux MCP registration.");
+            let details = claude_registration_details(programs);
+            println!("{}", existing_registration_message(&details, current_exe));
         }
         ClaudeCommand::Ran(output) => {
             return Err(claude_failure("register the crux MCP server", &output));
         }
     }
 
-    let instructions = instruction_path(home, project, Client::Claude);
-    let report = edit_file(&instructions, |content| {
+    let report = edit_file(instructions, |content| {
         insert_or_replace(content, ADOPTION_BODY)
     })?;
-    print_edit(&instructions, &report, "installed crux code index guidance");
+    print_edit(instructions, &report, "installed crux code index guidance");
     Ok(())
 }
 
-fn unsetup_claude(home: &Path, project: Option<&Path>) -> Result<()> {
-    match run_claude(&[
-        OsString::from("mcp"),
-        OsString::from("remove"),
-        OsString::from("crux"),
-        OsString::from("--scope"),
-        OsString::from("user"),
-    ])? {
+fn unsetup_claude(instructions: &Path, programs: &[OsString]) -> Result<()> {
+    match run_claude(
+        programs,
+        &[
+            OsString::from("mcp"),
+            OsString::from("remove"),
+            OsString::from("crux"),
+            OsString::from("--scope"),
+            OsString::from("user"),
+        ],
+    )? {
         ClaudeCommand::Absent => {
             println!("Claude CLI not found. Run: claude mcp remove crux --scope user")
         }
@@ -190,9 +204,8 @@ fn unsetup_claude(home: &Path, project: Option<&Path>) -> Result<()> {
         }
     }
 
-    let instructions = instruction_path(home, project, Client::Claude);
-    let report = edit_file(&instructions, remove_marker_block)?;
-    print_removal(&instructions, &report, "crux code index guidance");
+    let report = edit_file(instructions, remove_marker_block)?;
+    print_removal(instructions, &report, "crux code index guidance");
     Ok(())
 }
 
@@ -205,23 +218,28 @@ fn instruction_path(home: &Path, project: Option<&Path>, client: Client) -> Path
     }
 }
 
-fn codex_config_path(home: &Path) -> PathBuf {
-    env::var_os("CODEX_HOME")
+fn codex_config_path(home: &Path, codex_home: Option<OsString>) -> PathBuf {
+    codex_home
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"))
         .join("config.toml")
 }
 
-fn codex_server_body(current_exe: &Path) -> Result<String> {
+/// Encode the executable path as the TOML value of the `command` key.
+fn codex_command_value(current_exe: &Path) -> Result<String> {
     if !current_exe.is_absolute() {
         bail!(
             "the current executable path is not absolute: {}",
             current_exe.display()
         );
     }
-    let command = serde_json::to_string(&current_exe.to_string_lossy())
-        .context("encode the current executable path")?;
+    serde_json::to_string(&current_exe.to_string_lossy())
+        .context("encode the current executable path")
+}
+
+fn codex_server_body(current_exe: &Path) -> Result<String> {
+    let command = codex_command_value(current_exe)?;
     Ok(format!(
         "[mcp_servers.crux]\ncommand = {command}\nargs = []\n{}",
         CODEX_REQUIRED_KEYS
@@ -240,6 +258,18 @@ fn install_codex_config(content: &str, current_exe: &Path) -> Result<String> {
         }
         return insert_or_replace(content, &codex_server_body(current_exe)?);
     };
+
+    if let Some(marker) = &marker {
+        // The block owns the table when the block holds the table header.
+        // Crux then keeps the `command` key in step with the current executable.
+        if marker.start <= table.start && table.start < marker.end {
+            let body = &content[table.body_start..marker.end.min(table.end)];
+            let command = codex_command_value(current_exe)?;
+            if toml_key_value(body, "command") != Some(command.as_str()) {
+                return insert_or_replace(content, &codex_server_body(current_exe)?);
+            }
+        }
+    }
 
     let missing = missing_codex_keys(&content[table.body_start..table.end]);
     if missing.is_empty() {
@@ -260,6 +290,9 @@ fn install_codex_config(content: &str, current_exe: &Path) -> Result<String> {
 fn codex_table_span(content: &str) -> Result<Option<TomlTableSpan>> {
     let mut target: Option<TomlTableSpan> = None;
     let mut offset = 0;
+    // The compact name of the table that holds the current line.
+    // The root table has an empty name. Array tables have no name.
+    let mut current_table: Option<String> = Some(String::new());
 
     for line in content.split_inclusive('\n') {
         let line_end = offset + line.len();
@@ -269,7 +302,8 @@ fn codex_table_span(content: &str) -> Result<Option<TomlTableSpan>> {
                     table.end = offset;
                 }
             }
-            if compact_toml_name(name) == "mcp_servers.crux" {
+            let compact = compact_toml_name(name);
+            if compact == "mcp_servers.crux" {
                 if target.is_some() {
                     bail!("found duplicate [mcp_servers.crux] sections");
                 }
@@ -279,11 +313,59 @@ fn codex_table_span(content: &str) -> Result<Option<TomlTableSpan>> {
                     end: content.len(),
                 });
             }
+            current_table = (!name.is_empty()).then_some(compact);
+        } else if let Some(table) = current_table.as_deref() {
+            if defines_crux_entry(table, line) {
+                bail!(
+                    "found an existing crux entry under [mcp_servers] (inline table or dotted key); crux cannot edit it; replace it with a [mcp_servers.crux] section or remove it, then run crux setup codex again"
+                );
+            }
         }
         offset = line_end;
     }
 
     Ok(target)
+}
+
+/// Report a key line that defines `mcp_servers.crux` without a table header.
+/// Only the root table and the `[mcp_servers]` table can hold such a line.
+fn defines_crux_entry(table: &str, line: &str) -> bool {
+    if !table.is_empty() && table != "mcp_servers" {
+        return false;
+    }
+    let line = line.trim();
+    if line.starts_with('#') {
+        return false;
+    }
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+    let key = compact_toml_name(key);
+    let path = if table.is_empty() {
+        key
+    } else {
+        format!("{table}.{key}")
+    };
+    if path == "mcp_servers" {
+        // A root inline table: mcp_servers = { crux = { ... } }
+        return inline_table_defines(value, "crux");
+    }
+    path == "mcp_servers.crux" || path.starts_with("mcp_servers.crux.")
+}
+
+/// Report if an inline table text holds `key` at its top level.
+/// The scan is simple: it splits on commas and reads the key before `=`.
+fn inline_table_defines(inline: &str, key: &str) -> bool {
+    let inline = inline.trim();
+    if !inline.starts_with('{') {
+        return false;
+    }
+    inline
+        .trim_start_matches('{')
+        .split(',')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, _)| compact_toml_name(name))
+        .any(|name| name == key || name.starts_with(&format!("{key}.")))
 }
 
 fn toml_table_name(line: &str) -> Option<&str> {
@@ -303,10 +385,60 @@ fn toml_table_name(line: &str) -> Option<&str> {
     Some(name.trim())
 }
 
+/// Remove blanks outside quotes from a dotted TOML key.
+/// Also unquote each part that is a valid bare key.
+/// With this, `mcp_servers . "crux"` and `mcp_servers.crux` give the same name.
 fn compact_toml_name(name: &str) -> String {
-    name.chars()
-        .filter(|character| !matches!(character, ' ' | '\t'))
-        .collect()
+    let mut parts: Vec<String> = Vec::new();
+    let mut part = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in name.chars() {
+        if let Some(open) = quote {
+            part.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' && open == '"' {
+                escaped = true;
+            } else if character == open {
+                quote = None;
+            }
+            continue;
+        }
+        match character {
+            ' ' | '\t' => {}
+            '"' | '\'' => {
+                quote = Some(character);
+                part.push(character);
+            }
+            '.' => parts.push(std::mem::take(&mut part)),
+            _ => part.push(character),
+        }
+    }
+    parts.push(part);
+    parts
+        .iter()
+        .map(|part| unquote_bare_key(part))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn unquote_bare_key(part: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = part
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            let bare = !inner.is_empty()
+                && inner.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                });
+            if bare {
+                return inner;
+            }
+        }
+    }
+    part
 }
 
 fn missing_codex_keys(table_body: &str) -> Vec<&'static str> {
@@ -317,10 +449,18 @@ fn missing_codex_keys(table_body: &str) -> Vec<&'static str> {
 }
 
 fn toml_key_exists(table_body: &str, key: &str) -> bool {
-    table_body.lines().any(|line| {
-        let line = line.trim_start();
-        line.strip_prefix(key)
-            .is_some_and(|suffix| suffix.trim_start().starts_with('='))
+    toml_key_value(table_body, key).is_some()
+}
+
+/// Return the text after `key =` on the first line that sets `key`.
+fn toml_key_value<'a>(table_body: &'a str, key: &str) -> Option<&'a str> {
+    table_body.lines().find_map(|line| {
+        let suffix = line
+            .trim_start()
+            .strip_prefix(key)?
+            .trim_start()
+            .strip_prefix('=')?;
+        Some(suffix.trim())
     })
 }
 
@@ -466,7 +606,8 @@ fn edit_file(path: &Path, transform: impl FnOnce(&str) -> Result<String>) -> Res
         .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     let backup_created = create_backup_once(path, content.as_bytes())?;
-    fs::write(path, updated.as_bytes()).with_context(|| format!("write {}", path.display()))?;
+    atomic_write_preserving(path, updated.as_bytes())
+        .with_context(|| format!("write {}", path.display()))?;
     Ok(EditReport {
         backup_created,
         changed: true,
@@ -533,12 +674,66 @@ fn print_backup(path: &Path, report: &EditReport) {
     }
 }
 
-fn run_claude(arguments: &[OsString]) -> Result<ClaudeCommand> {
-    match Command::new("claude").args(arguments).output() {
-        Ok(output) => Ok(ClaudeCommand::Ran(output)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ClaudeCommand::Absent),
-        Err(error) => Err(error).context("run the Claude CLI"),
+/// List the program names that can start the Claude CLI, in the order to try.
+/// On Windows, npm installs the CLI as `claude.cmd`. Rust finds only `.exe` files by bare name.
+fn claude_programs() -> Vec<OsString> {
+    if cfg!(windows) {
+        vec![OsString::from("claude"), OsString::from("claude.cmd")]
+    } else {
+        vec![OsString::from("claude")]
     }
+}
+
+/// Run the first program that exists. Report the CLI as absent only when no program exists.
+fn run_claude(programs: &[OsString], arguments: &[OsString]) -> Result<ClaudeCommand> {
+    for program in programs {
+        match Command::new(program).args(arguments).output() {
+            Ok(output) => return Ok(ClaudeCommand::Ran(output)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("run the Claude CLI"),
+        }
+    }
+    Ok(ClaudeCommand::Absent)
+}
+
+/// Read the current crux registration. Return an empty text when the CLI cannot show it.
+fn claude_registration_details(programs: &[OsString]) -> String {
+    let arguments = [
+        OsString::from("mcp"),
+        OsString::from("get"),
+        OsString::from("crux"),
+    ];
+    match run_claude(programs, &arguments) {
+        Ok(ClaudeCommand::Ran(output)) if output.status.success() => command_output_text(&output),
+        _ => String::new(),
+    }
+}
+
+/// Report if the registration details name the current executable.
+/// The path must match a whole token. A prefix match is not enough,
+/// because `crux-0.10` and `crux.old` share a prefix with `crux`.
+fn registration_uses_executable(details: &str, current_exe: &Path) -> bool {
+    let current = current_exe.to_string_lossy();
+    details
+        .split(|character: char| character.is_whitespace() || matches!(character, '"' | '\''))
+        .any(|token| token == current)
+}
+
+/// Describe an existing registration. Crux keeps it, but tells the user when it is stale.
+fn existing_registration_message(details: &str, current_exe: &Path) -> String {
+    if details.is_empty() {
+        return format!(
+            "Claude Code reports an existing crux MCP registration. Crux kept it.\nTo register this binary instead, run these commands:\n  claude mcp remove crux --scope user\n  claude mcp add --scope user crux -- {}",
+            shell_quote(current_exe)
+        );
+    }
+    if registration_uses_executable(details, current_exe) {
+        return "No change to the Claude Code crux MCP registration.".to_string();
+    }
+    format!(
+        "The Claude Code crux MCP registration does not point to this binary. Crux kept it.\n{details}\nTo use this binary, run these commands:\n  claude mcp remove crux --scope user\n  claude mcp add --scope user crux -- {}",
+        shell_quote(current_exe)
+    )
 }
 
 fn claude_failure(action: &str, output: &Output) -> anyhow::Error {
@@ -779,5 +974,736 @@ mod tests {
         assert!(text_reports_missing_server("No MCP server named crux."));
         assert!(!text_reports_existing_server("permission denied"));
         assert!(!text_reports_missing_server("permission denied"));
+    }
+
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn os(value: &str) -> OsString {
+        OsString::from(value)
+    }
+
+    fn encoded(path: &Path) -> String {
+        serde_json::to_string(&path.to_string_lossy()).expect("encoded path")
+    }
+
+    #[test]
+    fn parse_client_arguments_accepts_each_client_without_a_project() {
+        for (name, client) in [("codex", Client::Codex), ("claude", Client::Claude)] {
+            assert_eq!(
+                parse_client_arguments(&arguments(&[name])).expect("parse client"),
+                (client, None)
+            );
+        }
+    }
+
+    #[test]
+    fn parse_client_arguments_accepts_both_project_spellings() {
+        let project = TestProject::new();
+        let directory = project.root.to_string_lossy().into_owned();
+
+        let separate =
+            parse_client_arguments(&arguments(&["codex", "--project", &directory])).expect("flag");
+        assert_eq!(separate, (Client::Codex, Some(project.root.clone())));
+
+        let joined =
+            parse_client_arguments(&arguments(&["claude", &format!("--project={directory}")]))
+                .expect("joined flag");
+        assert_eq!(joined, (Client::Claude, Some(project.root.clone())));
+    }
+
+    #[test]
+    fn parse_client_arguments_rejects_bad_input() {
+        let project = TestProject::new();
+        let missing = project.root.join("missing").to_string_lossy().into_owned();
+        let file = project.root.join("file.txt");
+        fs::write(&file, "text").expect("write fixture");
+        let file = file.to_string_lossy().into_owned();
+        let cases = [
+            (arguments(&[]), "a client is required"),
+            (arguments(&["vim"]), "unsupported client 'vim'"),
+            (
+                arguments(&["codex", "--project="]),
+                "--project requires a directory",
+            ),
+            (
+                arguments(&["codex", "--project", ""]),
+                "project directory does not exist",
+            ),
+            (
+                arguments(&["codex", "--project", &missing]),
+                "project directory does not exist",
+            ),
+            (
+                arguments(&["codex", &format!("--project={missing}")]),
+                "project directory does not exist",
+            ),
+            (
+                arguments(&["codex", "--project", &file]),
+                "project directory does not exist",
+            ),
+            (arguments(&["codex", "--project"]), "expected <client>"),
+            (arguments(&["codex", "--other", "x"]), "expected <client>"),
+            (arguments(&["codex", "extra"]), "expected <client>"),
+        ];
+        for (input, message) in cases {
+            let error = parse_client_arguments(&input)
+                .expect_err("reject input")
+                .to_string();
+            assert!(error.contains(message), "{input:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn instruction_paths_follow_the_client_and_the_project() {
+        let home = Path::new("/home/user");
+        let project = Path::new("/work/app");
+        assert_eq!(
+            instruction_path(home, None, Client::Codex),
+            home.join(".codex/AGENTS.md")
+        );
+        assert_eq!(
+            instruction_path(home, None, Client::Claude),
+            home.join(".claude/CLAUDE.md")
+        );
+        assert_eq!(
+            instruction_path(home, Some(project), Client::Codex),
+            project.join("AGENTS.md")
+        );
+        assert_eq!(
+            instruction_path(home, Some(project), Client::Claude),
+            project.join("CLAUDE.md")
+        );
+    }
+
+    #[test]
+    fn codex_config_path_honors_codex_home() {
+        let home = Path::new("/home/user");
+        let default = home.join(".codex").join("config.toml");
+        assert_eq!(codex_config_path(home, None), default);
+        assert_eq!(codex_config_path(home, Some(os(""))), default);
+        assert_eq!(
+            codex_config_path(home, Some(os("/custom"))),
+            Path::new("/custom").join("config.toml")
+        );
+    }
+
+    #[test]
+    fn home_directory_falls_back_to_userprofile() {
+        assert_eq!(
+            home_from(Some(os("/home/user")), Some(os("C:\\Users\\user"))),
+            Some(PathBuf::from("/home/user"))
+        );
+        assert_eq!(
+            home_from(None, Some(os("C:\\Users\\user"))),
+            Some(PathBuf::from("C:\\Users\\user"))
+        );
+        assert_eq!(
+            home_from(Some(os("")), Some(os("C:\\Users\\user"))),
+            Some(PathBuf::from("C:\\Users\\user"))
+        );
+        assert_eq!(home_from(Some(os("")), None), None);
+        assert_eq!(home_from(None, Some(os(""))), None);
+    }
+
+    #[test]
+    fn rerunning_codex_setup_refreshes_a_stale_executable_path() {
+        let project = TestProject::new();
+        let first = project.root.join("a/crux");
+        let second = project.root.join("b/crux");
+        let original = "model = \"gpt-5\"\n";
+
+        let installed = install_codex_config(original, &first).expect("first install");
+        let moved = install_codex_config(&installed, &second).expect("second install");
+
+        assert!(moved.contains(&format!("command = {}", encoded(&second))));
+        assert!(!moved.contains(&encoded(&first)));
+        assert_eq!(moved.matches("[mcp_servers.crux]").count(), 1);
+        assert_eq!(moved.matches(BEGIN_MARKER).count(), 1);
+        assert_eq!(
+            moved,
+            install_codex_config(original, &second).expect("fresh install")
+        );
+        assert_eq!(
+            install_codex_config(&moved, &second).expect("repeat install"),
+            moved
+        );
+        assert_eq!(remove_marker_block(&moved).expect("unsetup"), original);
+    }
+
+    #[test]
+    fn codex_refresh_keeps_line_endings_and_later_content() {
+        let project = TestProject::new();
+        let first = project.root.join("a/crux");
+        let second = project.root.join("b/crux");
+        let original = "model = \"gpt-5\"\r\n";
+        let installed = install_codex_config(original, &first).expect("first install");
+        let installed = format!("{installed}\r\n[features]\r\napps = true\r\n");
+
+        let moved = install_codex_config(&installed, &second).expect("second install");
+
+        assert!(moved.contains(&encoded(&second)));
+        assert!(!moved.contains(&encoded(&first)));
+        assert!(moved.ends_with("\r\n[features]\r\napps = true\r\n"));
+        assert!(!moved.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn codex_refresh_leaves_user_owned_tables_alone() {
+        let project = TestProject::new();
+        let first = project.root.join("a/crux");
+        let second = project.root.join("b/crux");
+        let original = "[mcp_servers.crux]\ncommand = \"/user/crux\"\nargs = []\nrequired = true\nstartup_timeout_sec = 30\n";
+
+        let extended = install_codex_config(original, &first).expect("first install");
+        let again = install_codex_config(&extended, &second).expect("second install");
+
+        assert_eq!(again, extended);
+        assert!(again.contains("command = \"/user/crux\""));
+    }
+
+    #[test]
+    fn codex_setup_and_unsetup_work_on_explicit_paths() {
+        let project = TestProject::new();
+        let config = project.root.join("codex-home/config.toml");
+        let agents = project.root.join("work/AGENTS.md");
+        let first = project.root.join("a/crux");
+        let second = project.root.join("b/crux");
+        fs::create_dir_all(config.parent().expect("config parent")).expect("create directory");
+        fs::write(&config, "model = \"gpt-5\"\n").expect("write fixture");
+
+        setup_codex(&config, &agents, &first).expect("first setup");
+        setup_codex(&config, &agents, &second).expect("second setup");
+
+        let text = fs::read_to_string(&config).expect("read config");
+        assert!(text.contains(&encoded(&second)));
+        assert!(!text.contains(&encoded(&first)));
+        assert_eq!(
+            fs::read_to_string(backup_path(&config)).expect("read backup"),
+            "model = \"gpt-5\"\n"
+        );
+        assert!(fs::read_to_string(&agents)
+            .expect("read agents")
+            .contains(BEGIN_MARKER));
+
+        unsetup_codex(&config, &agents).expect("unsetup");
+        assert_eq!(
+            fs::read_to_string(&config).expect("read config"),
+            "model = \"gpt-5\"\n"
+        );
+        assert_eq!(fs::read_to_string(&agents).expect("read agents"), "");
+    }
+
+    #[test]
+    fn quoted_crux_table_names_match_the_bare_name() {
+        let current_exe = env::current_exe().expect("current test executable");
+        let headers = [
+            "[mcp_servers.\"crux\"]",
+            "[mcp_servers.'crux']",
+            "[ mcp_servers . \"crux\" ]",
+            "[\"mcp_servers\".crux]",
+        ];
+        for header in headers {
+            let complete = format!(
+                "{header}\ncommand = \"/user/crux\"\nargs = []\nrequired = true\nstartup_timeout_sec = 30\nomit_tools_from = [\"deferred\"]\n"
+            );
+            assert_eq!(
+                install_codex_config(&complete, &current_exe).expect("complete table"),
+                complete,
+                "{header}"
+            );
+
+            let partial = format!("{header}\ncommand = \"/user/crux\"\n");
+            let installed = install_codex_config(&partial, &current_exe).expect("partial table");
+            assert_eq!(installed.matches("mcp_servers").count(), 1, "{header}");
+            assert!(installed.starts_with(&partial), "{header}");
+            assert!(installed.contains(BEGIN_MARKER), "{header}");
+            assert!(installed.contains("required = true"), "{header}");
+            assert_eq!(
+                install_codex_config(&installed, &current_exe).expect("repeat install"),
+                installed,
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn defines_crux_entry_finds_a_root_inline_mcp_servers_table() {
+        assert!(defines_crux_entry(
+            "",
+            r#"mcp_servers = { crux = { command = "/old/crux", args = [] } }"#
+        ));
+        assert!(defines_crux_entry(
+            "",
+            r#"mcp_servers = { other = { command = "x" }, "crux" = { command = "y" } }"#
+        ));
+        assert!(!defines_crux_entry(
+            "",
+            r#"mcp_servers = { other = { command = "x" } }"#
+        ));
+        assert!(!defines_crux_entry("", r#"mcp_servers = "not a table""#));
+    }
+
+    #[test]
+    fn compact_toml_name_unquotes_only_bare_key_parts() {
+        assert_eq!(compact_toml_name("mcp_servers.crux"), "mcp_servers.crux");
+        assert_eq!(
+            compact_toml_name(" mcp_servers\t.\t\"crux\" "),
+            "mcp_servers.crux"
+        );
+        assert_eq!(
+            compact_toml_name("'mcp_servers'.'crux'"),
+            "mcp_servers.crux"
+        );
+        assert_eq!(
+            compact_toml_name("mcp_servers.\"cru x\""),
+            "mcp_servers.\"cru x\""
+        );
+        assert_eq!(
+            compact_toml_name("\"mcp_servers.crux\""),
+            "\"mcp_servers.crux\""
+        );
+        assert_eq!(
+            compact_toml_name("mcp_servers.\"cr\\\"ux\""),
+            "mcp_servers.\"cr\\\"ux\""
+        );
+        assert_eq!(compact_toml_name("mcp_servers.\"\""), "mcp_servers.\"\"");
+    }
+
+    #[test]
+    fn codex_setup_refuses_crux_entries_without_a_table_header() {
+        let current_exe = env::current_exe().expect("current test executable");
+        let cases = [
+            "[mcp_servers]\ncrux = { command = \"/old/crux\", args = [] }\n",
+            "[mcp_servers]\ncrux.command = \"/old/crux\"\n",
+            "[mcp_servers]\n\"crux\" = { command = \"/old/crux\" }\n",
+            "[mcp_servers]\n  'crux' . command = \"/old/crux\"\n",
+            "[mcp_servers]\nother = { command = \"x\" }\ncrux = {}\n",
+            "[mcp_servers]\r\ncrux = {}\r\n",
+            "model = \"gpt-5\"\nmcp_servers.crux.command = \"/old/crux\"\n",
+            "model = \"gpt-5\"\nmcp_servers.crux = { command = \"/old/crux\" }\n",
+        ];
+        for content in cases {
+            let error = install_codex_config(content, &current_exe)
+                .expect_err("refuse existing entry")
+                .to_string();
+            assert!(
+                error.contains("existing crux entry under [mcp_servers]"),
+                "{content:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_setup_ignores_keys_that_only_look_like_crux() {
+        let current_exe = env::current_exe().expect("current test executable");
+        let cases = [
+            "[mcp_servers]\nother = { command = \"x\" }\n",
+            "[mcp_servers]\n# crux = {}\n",
+            "[mcp_servers]\ncrux_old = {}\ncrux-old = 1\n",
+            "[other]\ncrux = 1\n",
+            "[mcp_servers.other]\ncrux = 1\n",
+            "[[mcp_servers.other]]\ncrux = 1\n",
+            "crux = 1\n",
+        ];
+        for content in cases {
+            let installed = install_codex_config(content, &current_exe)
+                .unwrap_or_else(|error| panic!("{content:?}: {error}"));
+            assert!(installed.starts_with(content), "{content:?}");
+            assert_eq!(installed.matches("[mcp_servers.crux]").count(), 1);
+            assert_eq!(installed.matches(BEGIN_MARKER).count(), 1);
+        }
+    }
+
+    #[test]
+    fn codex_setup_stops_on_an_inline_crux_entry_without_writing() {
+        let project = TestProject::new();
+        let config = project.root.join("config.toml");
+        let agents = project.root.join("AGENTS.md");
+        let content = "[mcp_servers]\ncrux = { command = \"/old/crux\", args = [] }\n";
+        fs::write(&config, content).expect("write fixture");
+
+        let error = setup_codex(&config, &agents, &project.root.join("crux"))
+            .expect_err("stop on inline entry")
+            .to_string();
+
+        assert!(error.contains("replace it with a [mcp_servers.crux] section"));
+        assert_eq!(fs::read_to_string(&config).expect("read config"), content);
+        assert!(!backup_path(&config).exists());
+        assert!(!agents.exists());
+    }
+
+    #[test]
+    fn edit_file_replaces_the_file_instead_of_rewriting_it_in_place() {
+        let project = TestProject::new();
+        let path = project.root.join("CLAUDE.md");
+        let alias = project.root.join("alias.md");
+        fs::write(&path, "original").expect("write fixture");
+        fs::hard_link(&path, &alias).expect("link fixture");
+
+        edit_file(&path, |content| insert_or_replace(content, "body")).expect("edit file");
+
+        assert_eq!(fs::read_to_string(&alias).expect("read alias"), "original");
+        assert!(fs::read_to_string(&path)
+            .expect("read file")
+            .contains(BEGIN_MARKER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edit_file_keeps_a_symlinked_file_and_its_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let project = TestProject::new();
+        let real = project.root.join("dotfiles/CLAUDE.md");
+        let link = project.root.join(".claude/CLAUDE.md");
+        fs::create_dir_all(real.parent().expect("real parent")).expect("create directory");
+        fs::create_dir_all(link.parent().expect("link parent")).expect("create directory");
+        fs::write(&real, "original").expect("write fixture");
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).expect("set mode");
+        symlink("../dotfiles/CLAUDE.md", &link).expect("create link");
+
+        let report =
+            edit_file(&link, |content| insert_or_replace(content, "body")).expect("edit file");
+
+        assert!(report.changed);
+        assert!(fs::symlink_metadata(&link)
+            .expect("link metadata")
+            .file_type()
+            .is_symlink());
+        assert!(fs::read_to_string(&real)
+            .expect("read target")
+            .contains(BEGIN_MARKER));
+        assert_eq!(
+            fs::metadata(&real)
+                .expect("target metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read_to_string(backup_path(&link)).expect("read backup"),
+            "original"
+        );
+        let names: Vec<_> = fs::read_dir(real.parent().expect("real parent"))
+            .expect("list directory")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect();
+        assert_eq!(names, vec![os("CLAUDE.md")]);
+    }
+
+    #[test]
+    fn claude_programs_start_with_the_plain_command() {
+        let programs = claude_programs();
+        assert_eq!(programs[0], os("claude"));
+        assert_eq!(programs.len(), if cfg!(windows) { 2 } else { 1 });
+        if cfg!(windows) {
+            assert_eq!(programs[1], os("claude.cmd"));
+        }
+    }
+
+    #[test]
+    fn run_claude_reports_absent_only_when_every_program_is_missing() {
+        let project = TestProject::new();
+        let programs = vec![
+            project.root.join("missing-one").into_os_string(),
+            project.root.join("missing-two").into_os_string(),
+        ];
+        assert!(matches!(
+            run_claude(&programs, &[os("mcp"), os("get"), os("crux")]).expect("run claude"),
+            ClaudeCommand::Absent
+        ));
+        assert!(matches!(
+            run_claude(&[], &[os("mcp")]).expect("run claude"),
+            ClaudeCommand::Absent
+        ));
+    }
+
+    #[test]
+    fn existing_registration_message_flags_a_stale_command() {
+        let current_exe = Path::new("/opt/crux/bin/crux");
+        let current = "crux:\n  Command: /opt/crux/bin/crux\n  Args:";
+        let stale = "crux:\n  Command: /old/crux";
+
+        let unchanged = "No change to the Claude Code crux MCP registration.";
+        assert_eq!(
+            existing_registration_message(current, current_exe),
+            unchanged
+        );
+
+        let message = existing_registration_message(stale, current_exe);
+        assert!(message.contains("does not point to this binary"));
+        assert!(message.contains("Command: /old/crux"));
+        assert!(message.contains("claude mcp remove crux --scope user"));
+        assert!(message.contains(&format!(
+            "claude mcp add --scope user crux -- {}",
+            shell_quote(current_exe)
+        )));
+    }
+
+    #[test]
+    fn existing_registration_message_needs_a_whole_token_match() {
+        let current_exe = Path::new("/opt/crux/bin/crux");
+        let unchanged = "No change to the Claude Code crux MCP registration.";
+
+        let prefix = existing_registration_message("Command: /opt/crux/bin/crux-0.10", current_exe);
+        assert!(!prefix.contains(unchanged), "{prefix}");
+        assert!(prefix.contains("does not point to this binary"), "{prefix}");
+
+        let quoted = existing_registration_message(
+            "Command: \"/opt/crux/bin/crux\" --profile full",
+            current_exe,
+        );
+        assert_eq!(quoted, unchanged);
+
+        let empty = existing_registration_message("", current_exe);
+        assert!(!empty.contains(unchanged), "{empty}");
+        assert!(empty.contains("Crux kept it"), "{empty}");
+        assert!(
+            empty.contains("claude mcp add --scope user crux -- '/opt/crux/bin/crux'"),
+            "{empty}"
+        );
+    }
+
+    #[test]
+    fn setup_claude_continues_when_the_cli_is_absent() {
+        let project = TestProject::new();
+        let instructions = project.root.join("work/CLAUDE.md");
+        let programs = vec![project.root.join("no-such-claude").into_os_string()];
+
+        setup_claude(&instructions, &project.root.join("crux"), &programs).expect("setup claude");
+
+        assert!(fs::read_to_string(&instructions)
+            .expect("read instructions")
+            .contains(BEGIN_MARKER));
+    }
+
+    #[cfg(unix)]
+    static FAKE_CLAUDE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A shell script that stands in for the Claude CLI.
+    /// It logs each call and answers by the second argument: add, get, or remove.
+    /// The guard serializes the fake CLI tests in this module.
+    #[cfg(unix)]
+    struct FakeClaude {
+        programs: Vec<OsString>,
+        log: PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    #[cfg(unix)]
+    impl FakeClaude {
+        fn new(directory: &Path, cases: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let guard = FAKE_CLAUDE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let program = directory.join("claude");
+            let log = directory.join("claude.log");
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$2\" in\n{cases}\nesac\n",
+                log.display()
+            );
+            fs::write(&program, script).expect("write fake claude");
+            fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+                .expect("make fake claude executable");
+            Self {
+                programs: vec![program.into_os_string()],
+                log,
+                _guard: guard,
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_claude_falls_back_to_the_next_program() {
+        let project = TestProject::new();
+        let fake = FakeClaude::new(&project.root, "get) echo found; exit 0;;");
+        let programs = vec![
+            project.root.join("missing").into_os_string(),
+            fake.programs[0].clone(),
+        ];
+
+        let result = run_claude(&programs, &[os("mcp"), os("get"), os("crux")]).expect("run");
+
+        let ClaudeCommand::Ran(output) = result else {
+            panic!("expected the fallback program to run");
+        };
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "found");
+        assert_eq!(fake.calls(), vec!["mcp get crux".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_claude_returns_spawn_errors_other_than_not_found() {
+        use std::os::unix::fs::PermissionsExt;
+        let project = TestProject::new();
+        let program = project.root.join("claude");
+        fs::write(&program, "not executable").expect("write fixture");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o644)).expect("set mode");
+
+        let result = run_claude(&[program.into_os_string()], &[os("mcp")]);
+
+        let error = result.err().expect("spawn error").to_string();
+        assert!(error.contains("run the Claude CLI"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_claude_registers_the_server_with_the_cli() {
+        let project = TestProject::new();
+        let fake = FakeClaude::new(&project.root, "add) echo registered; exit 0;;");
+        let instructions = project.root.join("work/CLAUDE.md");
+        let current_exe = project.root.join("bin/crux");
+
+        setup_claude(&instructions, &current_exe, &fake.programs).expect("setup claude");
+
+        assert_eq!(
+            fake.calls(),
+            vec![format!(
+                "mcp add --scope user crux -- {}",
+                current_exe.display()
+            )]
+        );
+        assert!(fs::read_to_string(&instructions)
+            .expect("read instructions")
+            .contains(BEGIN_MARKER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_claude_keeps_an_existing_registration_and_inspects_it() {
+        let project = TestProject::new();
+        let fake = FakeClaude::new(
+            &project.root,
+            "add) echo 'MCP server crux already exists in user config' >&2; exit 1;;\nget) echo 'crux:'; echo '  Command: /elsewhere/crux'; exit 0;;",
+        );
+        let instructions = project.root.join("work/CLAUDE.md");
+        let current_exe = project.root.join("bin/crux");
+
+        setup_claude(&instructions, &current_exe, &fake.programs).expect("setup claude");
+
+        assert_eq!(
+            fake.calls(),
+            vec![
+                format!("mcp add --scope user crux -- {}", current_exe.display()),
+                "mcp get crux".to_string(),
+            ]
+        );
+        assert!(fs::read_to_string(&instructions)
+            .expect("read instructions")
+            .contains(BEGIN_MARKER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_claude_reports_cli_failures_and_skips_the_note() {
+        let project = TestProject::new();
+        let fake = FakeClaude::new(&project.root, "add) echo 'permission denied' >&2; exit 1;;");
+        let instructions = project.root.join("work/CLAUDE.md");
+
+        let error = setup_claude(&instructions, &project.root.join("crux"), &fake.programs)
+            .expect_err("setup fails")
+            .to_string();
+
+        assert!(
+            error.contains("could not register the crux MCP server: permission denied"),
+            "{error}"
+        );
+        assert!(!instructions.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsetup_claude_removes_the_registration_and_the_note() {
+        let project = TestProject::new();
+        let fake = FakeClaude::new(&project.root, "remove) echo removed; exit 0;;");
+        let instructions = project.root.join("CLAUDE.md");
+        let installed = insert_or_replace("keep\n", ADOPTION_BODY).expect("insert block");
+        fs::write(&instructions, installed).expect("write fixture");
+
+        unsetup_claude(&instructions, &fake.programs).expect("unsetup claude");
+
+        assert_eq!(
+            fake.calls(),
+            vec!["mcp remove crux --scope user".to_string()]
+        );
+        assert_eq!(
+            fs::read_to_string(&instructions).expect("read instructions"),
+            "keep\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsetup_claude_accepts_a_missing_registration() {
+        let project = TestProject::new();
+        let fake = FakeClaude::new(
+            &project.root,
+            "remove) echo 'No MCP server found with name: crux' >&2; exit 1;;",
+        );
+        let instructions = project.root.join("CLAUDE.md");
+        let installed = insert_or_replace("keep\n", ADOPTION_BODY).expect("insert block");
+        fs::write(&instructions, installed).expect("write fixture");
+
+        unsetup_claude(&instructions, &fake.programs).expect("unsetup claude");
+
+        assert_eq!(
+            fs::read_to_string(&instructions).expect("read instructions"),
+            "keep\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsetup_claude_reports_cli_failures_and_keeps_the_note() {
+        let project = TestProject::new();
+        let fake = FakeClaude::new(
+            &project.root,
+            "remove) echo 'permission denied' >&2; exit 1;;",
+        );
+        let instructions = project.root.join("CLAUDE.md");
+        let installed = insert_or_replace("keep\n", ADOPTION_BODY).expect("insert block");
+        fs::write(&instructions, &installed).expect("write fixture");
+
+        let error = unsetup_claude(&instructions, &fake.programs)
+            .expect_err("unsetup fails")
+            .to_string();
+
+        assert!(
+            error.contains("could not remove the crux MCP server: permission denied"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(&instructions).expect("read instructions"),
+            installed
+        );
+    }
+
+    #[test]
+    fn unsetup_claude_continues_when_the_cli_is_absent() {
+        let project = TestProject::new();
+        let instructions = project.root.join("CLAUDE.md");
+        let installed = insert_or_replace("keep\n", ADOPTION_BODY).expect("insert block");
+        fs::write(&instructions, installed).expect("write fixture");
+        let programs = vec![project.root.join("no-such-claude").into_os_string()];
+
+        unsetup_claude(&instructions, &programs).expect("unsetup claude");
+
+        assert_eq!(
+            fs::read_to_string(&instructions).expect("read instructions"),
+            "keep\n"
+        );
     }
 }

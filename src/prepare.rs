@@ -421,13 +421,79 @@ fn cache_validation(output: &Path, provenance: &Value, minimum: u64) -> Option<V
     Some(validation)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Replace `path` with `bytes` through a temporary file in the same directory.
+/// The new file gets the private mode that `tempfile` uses.
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().context("output parent")?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    let file = tempfile::NamedTempFile::new_in(parent)?;
+    persist_bytes(file, path, bytes)
+}
+
+/// Replace a user file with `bytes` through a temporary file.
+/// This function keeps the file link and the file mode of the user.
+/// - A symbolic link at `path` stays in place. The function replaces the file it points to.
+/// - An existing file keeps its permissions.
+/// - A new file gets the default mode, 0666 minus the umask.
+/// - A read-only file is an error, as it is for an in-place write.
+pub(crate) fn atomic_write_preserving(path: &Path, bytes: &[u8]) -> Result<()> {
+    let target = resolve_symlinks(path)?;
+    let parent = target.parent().context("output parent")?;
+    let existing = match fs::metadata(&target) {
+        Ok(metadata) => {
+            if metadata.permissions().readonly() {
+                bail!("{} is read-only", target.display());
+            }
+            Some(metadata.permissions())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut builder = tempfile::Builder::new();
+    if existing.is_none() {
+        if let Some(permissions) = new_file_permissions() {
+            builder.permissions(permissions);
+        }
+    }
+    let file = builder.tempfile_in(parent)?;
+    if let Some(permissions) = existing {
+        file.as_file().set_permissions(permissions)?;
+    }
+    persist_bytes(file, &target, bytes)
+}
+
+fn persist_bytes(mut file: tempfile::NamedTempFile, path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|error| error.error)?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn new_file_permissions() -> Option<fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+    Some(fs::Permissions::from_mode(0o666))
+}
+
+#[cfg(not(unix))]
+fn new_file_permissions() -> Option<fs::Permissions> {
+    None
+}
+
+/// Follow symbolic links until the path names a file or nothing.
+/// A link that points to a missing file stays valid: the caller creates the file there.
+fn resolve_symlinks(path: &Path) -> Result<PathBuf> {
+    const MAX_LINKS: usize = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let link = fs::read_link(&current)?;
+                current = current.parent().unwrap_or_else(|| Path::new("")).join(link);
+            }
+            _ => return Ok(current),
+        }
+    }
+    bail!("too many levels of symbolic links: {}", path.display())
 }
 
 fn prepare(options: &Options, report: &mut Value) -> Result<()> {
@@ -869,5 +935,132 @@ mod tests {
         };
         let serialized = normalized_plan(&plan, Path::new("/tmp/one")).unwrap();
         assert_eq!(serialized["arguments"][1], "$SCRATCH/index.scip");
+    }
+
+    #[test]
+    fn atomic_write_preserving_creates_and_replaces_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        atomic_write_preserving(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        atomic_write_preserving(&path, b"second").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second");
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("config.toml")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserving_keeps_symlink_and_target_mode() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles/CLAUDE.md");
+        fs::create_dir(real.parent().unwrap()).unwrap();
+        fs::write(&real, "old").unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o640)).unwrap();
+        let link = dir.path().join("CLAUDE.md");
+        symlink("dotfiles/CLAUDE.md", &link).unwrap();
+        let old_inode = fs::metadata(&real).unwrap().ino();
+
+        atomic_write_preserving(&link, b"new").unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_to_string(&real).unwrap(), "new");
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_ne!(fs::metadata(&real).unwrap().ino(), old_inode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserving_follows_a_link_to_a_missing_file() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("config.toml");
+        symlink("real.toml", &link).unwrap();
+
+        atomic_write_preserving(&link, b"created").unwrap();
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("real.toml")).unwrap(),
+            "created"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserving_rejects_symlink_loops() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        symlink("second", &first).unwrap();
+        symlink("first", &second).unwrap();
+
+        let error = atomic_write_preserving(&first, b"data").unwrap_err();
+        assert!(error.to_string().contains("too many levels"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserving_refuses_a_read_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "locked").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+
+        let error = atomic_write_preserving(&path, b"new").unwrap_err();
+
+        assert!(error.to_string().contains("read-only"), "{error}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "locked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserving_leaves_no_temporary_file_after_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("occupied");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("child"), "x").unwrap();
+
+        assert!(atomic_write_preserving(&path, b"data").is_err());
+
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("occupied")]);
+        assert!(path.join("child").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserving_gives_new_files_the_umask_default_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("AGENTS.md");
+        let reference = dir.path().join("reference");
+        fs::write(&reference, "data").unwrap();
+
+        atomic_write_preserving(&path, b"data").unwrap();
+
+        // A plain file creation applies 0666 minus the umask. The new file must match it.
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&reference).unwrap().permissions().mode() & 0o777
+        );
     }
 }
